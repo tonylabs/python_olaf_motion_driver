@@ -100,7 +100,11 @@ MOTOR_TABLE: dict[str, MotorSpec] = {
 # Loop rates
 # ---------------------------------------------------------------------------
 POLICY_HZ       = 50.0
-MOTOR_HZ        = 600.0
+# 200 Hz gives 5× Nyquist headroom over the 37.5 Hz LPF cutoff and keeps
+# total CAN traffic (12 motors × (cmd + reply)) under the 1 Mbps bus.
+# 600 Hz saturated the bus once the Robstride library started receiving
+# real status replies from the motors.
+MOTOR_HZ        = 200.0
 POLICY_DT       = 1.0 / POLICY_HZ
 MOTOR_DT        = 1.0 / MOTOR_HZ
 LPF_CUTOFF_HZ   = 37.5                      # per paper §VII-C

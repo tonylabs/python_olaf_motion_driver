@@ -1,152 +1,147 @@
+"""Xbox One S controller → robot velocity command.
+
+The left stick drives the robot:
+    left-stick up    →  +vx (forward)
+    left-stick down  →  -vx (backward)
+    left-stick left  →  +vy (left)
+    left-stick right →  -vy (right)
+
+Convention follows ROS REP-103: +x forward, +y left. Stick axes are inverted
+from SDL's raw values (SDL: up = -1) to give this convention directly.
+
+Use from `run.py` like:
+
+    joy = Joystick(max_lin_vel=0.8)
+    joy.start()
+    ...
+    self._velocity_cmd = joy.velocity_cmd    # in policy tick
+    ...
+    joy.stop()
+
+Run standalone to verify mapping:
+
+    python joystick.py
+"""
+from __future__ import annotations
+
 import os
+import threading
+import time
+
+os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+
+import numpy as np
 import pygame
-import json
 
-# Set SDL to use dummy video driver (no display required)
-os.environ['SDL_VIDEODRIVER'] = 'dummy'
+_AXIS_LEFT_X = 0
+_AXIS_LEFT_Y = 1
 
-class JoyStick:
-    #按键定义
-    LaxiX = 0.0    #左摇杆X轴，axis[0]
-    LaxiY = 0.0    #左摇杆Y轴，axis[1]
-    RaxiX = 0.0    #右摇杆X轴，axis[2]
-    RaxiY = 0.0    #右摇杆Y轴，axis[3]
-    hatX = 0       #方向键X轴，hat[0]
-    hatY = 0       #方向键Y轴，hat[1]
-    butA = 0       #A键，but[0]
-    butB = 0       #B键，but[1]
-    butX = 0       #X键，but[3]
-    butY = 0       #Y键，but[4]
-    L1 = 0         #L1键，but[6]
-    R1 = 0         #R1键，but[7]
-    L2 = 0         #L2键，but[8]
-    R2 = 0         #R2键，but[9]
-    SELECT = 0     #SELECT键，but[10]
-    START = 0      #START键，but[11]
-    
-    def __init__(self):
+
+class Joystick:
+    """Background-polled Xbox controller. Exposes a 4-vector
+    `velocity_cmd = [vx, vy, wz, heading]` matching the policy's obs.
+
+    Only vx / vy are driven by the left stick; wz and heading stay zero.
+    """
+
+    def __init__(self,
+                 device: int = 0,
+                 max_lin_vel: float = 1.0,
+                 deadzone: float = 0.08,
+                 poll_hz: float = 100.0):
+        self._device = device
+        self._max_v = float(max_lin_vel)
+        self._deadzone = float(deadzone)
+        self._dt = 1.0 / float(poll_hz)
+
+        self._cmd = np.zeros(4, dtype=np.float32)
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._js: pygame.joystick.JoystickType | None = None
+
+    # -- lifecycle ----------------------------------------------------------
+    def start(self) -> None:
         pygame.init()
         pygame.joystick.init()
-        
-    def initjoystick(self):
-        pygame.init()
-        pygame.joystick.init()
-        self.joystick = pygame.joystick.Joystick(0)
-        self.joystick.init()
+        if pygame.joystick.get_count() <= self._device:
+            raise RuntimeError(
+                f"Joystick {self._device} not found "
+                f"(pygame sees {pygame.joystick.get_count()} devices)"
+            )
+        self._js = pygame.joystick.Joystick(self._device)
+        self._js.init()
 
-    def getjoystickstates(self):
-        self.joystick = pygame.joystick.Joystick(0)
-        self.joystick.init()
-        
-        for event in pygame.event.get():  # User did something
-            if event.type == pygame.JOYAXISMOTION:
-                self.LaxiX = self.joystick.get_axis(0)
-                self.LaxiY = self.joystick.get_axis(1)
-                self.RaxiX = self.joystick.get_axis(2)
-                self.RaxiY = self.joystick.get_axis(3)
+        self._thread = threading.Thread(target=self._loop, daemon=True,
+                                        name="joystick-poll")
+        self._thread.start()
 
-            if event.type == pygame.JOYHATMOTION:
-                hat = self.joystick.get_hat(0)
-                self.hatX = hat[0]
-                self.hatY = hat[1]
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.5)
+        if self._js is not None:
+            self._js.quit()
+        pygame.quit()
 
-            if event.type == pygame.JOYBUTTONDOWN:
-                self.butA = self.joystick.get_button(0)
-                self.butB = self.joystick.get_button(1)
-                self.butX = self.joystick.get_button(3)
-                self.butY = self.joystick.get_button(4)
-                self.L1 = self.joystick.get_button(6)
-                self.R1 = self.joystick.get_button(7)
-                self.L2 = self.joystick.get_button(8)
-                self.R2 = self.joystick.get_button(9)
-                self.SELECT = self.joystick.get_button(10)
-                self.START = self.joystick.get_button(11)
+    # -- public state -------------------------------------------------------
+    @property
+    def velocity_cmd(self) -> np.ndarray:
+        """(4,) float32 snapshot of [vx, vy, wz, heading]. Safe to read."""
+        with self._lock:
+            return self._cmd.copy()
 
-            if event.type == pygame.JOYBUTTONUP:
-                self.butA = self.joystick.get_button(0)
-                self.butB = self.joystick.get_button(1)
-                self.butX = self.joystick.get_button(3)
-                self.butY = self.joystick.get_button(4)
-                self.L1 = self.joystick.get_button(6)
-                self.R1 = self.joystick.get_button(7)
-                self.L2 = self.joystick.get_button(8)
-                self.R2 = self.joystick.get_button(9)
-                self.SELECT = self.joystick.get_button(10)
-                self.START = self.joystick.get_button(11)
-        
-    def display(self):
-        print('================')
-        print('Axies:')
-        print('LaxiX: {}'.format(self.LaxiX))
-        print('LaxiY: {}'.format(self.LaxiY))
-        print('RaxiX: {}'.format(self.RaxiX))
-        print('RaxiY: {}'.format(self.RaxiY))
-        print('----------------')
-        print('Hat:')
-        print('hatX: {}'.format(self.hatX))
-        print('hatY: {}'.format(self.hatY))
-        print('----------------')
-        print('button:')
-        print('butA: {}'.format(self.butA))
-        print('butB: {}'.format(self.butB))
-        print('butX: {}'.format(self.butX))
-        print('butY: {}'.format(self.butY))
-        print('L1: {}'.format(self.L1))
-        print('R1: {}'.format(self.R1))
-        print('L2: {}'.format(self.L2))
-        print('R2: {}'.format(self.R2))
-        print('SELECT: {}'.format(self.SELECT))
-        print('START: {}'.format(self.START))
-        print('================')
-                
-joy = JoyStick()
+    # -- internals ----------------------------------------------------------
+    def _apply_deadzone(self, v: float) -> float:
+        if abs(v) < self._deadzone:
+            return 0.0
+        # Rescale outside deadzone to span [0, 1] so the stick feels full-range
+        sign = 1.0 if v > 0 else -1.0
+        return sign * (abs(v) - self._deadzone) / (1.0 - self._deadzone)
 
-def init_joystick():
-    global joy
-    joy.initjoystick()
+    def _loop(self) -> None:
+        assert self._js is not None
+        while not self._stop.is_set():
+            pygame.event.pump()   # required for axis values to refresh
+            lx = self._apply_deadzone(self._js.get_axis(_AXIS_LEFT_X))
+            ly = self._apply_deadzone(self._js.get_axis(_AXIS_LEFT_Y))
+            # SDL: stick up = -1, stick right = +1. Flip both so the robot
+            # convention (forward = +vx, left = +vy) matches the user.
+            vx = -ly * self._max_v
+            vy = -lx * self._max_v
+            with self._lock:
+                self._cmd[0] = vx
+                self._cmd[1] = vy
+                # wz and heading stay zero — not driven by left stick
+            time.sleep(self._dt)
 
-def read_joystick():
-    global joy
-    joy.getjoystickstates()
-    
-    result = {
-        "LaxiX": 0.,
-        "LaxiY": 0.,
-        "RaxiX": 0.,
-        "RaxiY": 0.,
-        "hatX": 0,
-        "hatY": 0,
-        "butA": 0,
-        "butB": 0,
-        "butX": 0,
-        "butY": 0,
-        "L1": 0,
-        "R1": 0,
-        "L2": 0,
-        "R2": 0,
-        "SELECT": 0,
-        "START": 0,
-    }
 
-    result["LaxiX"] = joy.LaxiX
-    result["LaxiY"] = joy.LaxiY
-    result["RaxiX"] = joy.RaxiX
-    result["RaxiY"] = joy.RaxiY
-    
-    result["hatX"] = joy.hatX
-    result["hatY"] = joy.hatY
-    
-    result["butA"] = joy.butA
-    result["butB"] = joy.butB
-    result["butX"] = joy.butX
-    result["butY"] = joy.butY
-    
-    result["L1"] = joy.L1
-    result["R1"] = joy.R1
-    result["L2"] = joy.L2
-    result["R2"] = joy.R2
-    
-    result["SELECT"] = joy.SELECT
-    result["START"] = joy.START
-    
-    return json.dumps(result)
+def main() -> None:
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--max-vel", type=float, default=1.0)
+    parser.add_argument("--deadzone", type=float, default=0.08)
+    args = parser.parse_args()
+
+    joy = Joystick(device=args.device,
+                   max_lin_vel=args.max_vel,
+                   deadzone=args.deadzone)
+    joy.start()
+    print(f"Joystick started. max_vel={args.max_vel} m/s, "
+          f"deadzone={args.deadzone}. Ctrl+C to stop.")
+    try:
+        while True:
+            cmd = joy.velocity_cmd
+            print(f"\rvx={cmd[0]:+.2f}  vy={cmd[1]:+.2f}  "
+                  f"wz={cmd[2]:+.2f}  hdg={cmd[3]:+.2f}",
+                  end="", flush=True)
+            time.sleep(0.05)
+    except KeyboardInterrupt:
+        print()
+    finally:
+        joy.stop()
+
+
+if __name__ == "__main__":
+    main()

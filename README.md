@@ -91,3 +91,71 @@ crashing the motor thread:
 If you see `non-finite IMU angular velocity` or `non-finite target, damping
 this tick` warnings, the IMU serial parser is desyncing; the loop will keep
 running but the root cause is upstream.
+
+## Joystick control
+
+`run.py` drives the policy's `velocity_cmd` from an **Xbox One S controller**
+(USB or Bluetooth) via `joystick.py`. The left stick controls linear
+velocity in the robot's base frame (ROS REP-103 convention):
+
+| Left stick        | Command                    |
+|-------------------|----------------------------|
+| up                | `+vx` (forward)            |
+| down              | `-vx` (backward)           |
+| left              | `+vy` (left)               |
+| right             | `-vy` (right)              |
+
+`wz` (yaw rate) and `heading` stay at zero. Default max speed is **0.8 m/s**
+(set via `Runtime(joystick_max_vel=…)` — pick a value ≤ the velocity range
+used during training). Deadzone defaults to 0.08 and the region past the
+deadzone is rescaled so the stick still spans the full range.
+
+**If no controller is attached** `run.py` logs
+`joystick unavailable — velocity_cmd stays zero` and runs with a zero
+command, so bring-up works without a gamepad.
+
+### Setup (Ubuntu)
+
+```bash
+# Kernel drivers (Xbox controllers bind via xpad; ensure joydev is loaded
+# so /dev/input/js0 appears).
+sudo modprobe xpad joydev
+echo -e "xpad\njoydev" | sudo tee /etc/modules-load.d/xbox.conf
+
+# Read permission on /dev/input/js0 and event* nodes
+sudo usermod -aG input $USER   # log out/in or: newgrp input
+```
+
+For Bluetooth pairing:
+
+```bash
+bluetoothctl
+[bluetooth]# power on
+[bluetooth]# scan on
+# hold Xbox + Pair on the controller; wait for it to appear
+[bluetooth]# pair <MAC>
+[bluetooth]# trust <MAC>
+[bluetooth]# connect <MAC>
+```
+
+After `connect`, verify with `ls /dev/input/js*` — a `js0` should appear.
+
+### Standalone mapping check
+
+```bash
+python joystick_dump.py            # see which index is which button/axis
+python joystick.py --max-vel 1.0   # live readout of vx/vy from the left stick
+```
+
+Use `joystick_dump.py` first if axis/button indices don't match — mappings
+vary by driver (xpad, xone, bluez HID). The ground truth is the index; the
+names printed by `joystick_dump.py` are hints.
+
+### Heartbeat
+
+When the joystick is attached `run.py`'s 1 Hz heartbeat includes the live
+command so you can confirm the stick is reaching the policy:
+
+```
+hb kp=1.00 vx=+0.42 vy=-0.08 l_hip_yaw_joint:tgt=+0.003,q=+0.002
+```

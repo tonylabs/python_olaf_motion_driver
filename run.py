@@ -1,14 +1,14 @@
-"""Main runtime entry — 50 Hz policy tick, 600 Hz motor tick.
+"""Main runtime entry — 50 Hz policy tick, 200 Hz motor tick.
 
 Threads:
     * MAIN              — policy inference @ 50 Hz, writes q_target
-    * motor thread      — upsamples q_target to 600 Hz, LPF, sends CAN
+    * motor thread      — upsamples q_target to 200 Hz, LPF, sends CAN
 
 The two share ``_latest_target`` and ``_last_policy_t`` under a lock.  The
 motor thread holds the hot path; keep Python objects off it.
 
-On a non-RT Linux the 600 Hz tick will jitter visibly (±2–5 ms).  Use a
-PREEMPT_RT kernel and ``chrt -f 90`` for serious work.
+On a non-RT Linux the 200 Hz tick will jitter ~±1 ms. Use a PREEMPT_RT
+kernel and ``chrt -f 90`` for serious work.
 """
 from __future__ import annotations
 
@@ -38,6 +38,7 @@ from config import (
     SLOMO_VMAX_RAD_S,
 )
 from imu import Imu
+from joystick import Joystick
 from motors import MotorBus
 from observation import ObservationBuilder, OBS_DIM
 from policy import DeployedPolicy
@@ -64,12 +65,25 @@ class FirstOrderLowPass:
 class Runtime:
     def __init__(self, policy_dir: Path, can_channel: str = "can_usb",
                  slomo: bool = False,
-                 active_mask: np.ndarray | None = None):
+                 active_mask: np.ndarray | None = None,
+                 joystick_max_vel: float = 0.8):
         self._bus = CanBus(channel=can_channel, bitrate=1_000_000)
         self._motors = MotorBus(self._bus, dm_channel=can_channel)
         self._imu = Imu()
         self._policy = DeployedPolicy(policy_dir)
         self._obs_builder = ObservationBuilder()
+
+        # Joystick — best-effort. If no controller is plugged in, fall back
+        # to a zero velocity command (robot stands in place).
+        self._joystick: Joystick | None = None
+        try:
+            joy = Joystick(max_lin_vel=joystick_max_vel)
+            joy.start()
+            self._joystick = joy
+            log.info("joystick attached — left stick drives velocity_cmd "
+                     "(max %.2f m/s)", joystick_max_vel)
+        except Exception as e:
+            log.warning("joystick unavailable (%s) — velocity_cmd stays zero", e)
 
         # Shared state between policy tick and motor tick
         self._lock = threading.Lock()
@@ -79,7 +93,7 @@ class Runtime:
         self._kp_scale = 0.0
         self._stop = threading.Event()
 
-        # Command — exposed for a joystick hook to mutate.
+        # Command — used when no joystick is attached.
         self._velocity_cmd = np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
         self._lpf = FirstOrderLowPass(LPF_CUTOFF_HZ, MOTOR_DT, N_JOINTS)
@@ -149,8 +163,11 @@ class Runtime:
         q  = self._motors.joint_pos
         qd = self._motors.joint_vel
 
+        velocity_cmd = (self._joystick.velocity_cmd
+                        if self._joystick is not None
+                        else self._velocity_cmd)
         obs = self._obs_builder.build(
-            velocity_cmd=self._velocity_cmd,
+            velocity_cmd=velocity_cmd,
             base_ang_vel_root=ang_vel,
             projected_gravity=proj_g,
             joint_pos=q,
@@ -216,11 +233,14 @@ class Runtime:
                     hb_next = now + 1.0
                     with self._lock:
                         tgt = self._target_curr.copy()
+                    vcmd = (self._joystick.velocity_cmd
+                            if self._joystick is not None
+                            else self._velocity_cmd)
                     active = [(JOINT_ORDER[i], float(tgt[i]),
                                float(self._motors.joint_pos[i]))
                               for i, a in enumerate(self._active_mask) if a]
-                    log.info("hb kp=%.2f %s",
-                             ramp,
+                    log.info("hb kp=%.2f vx=%+.2f vy=%+.2f %s",
+                             ramp, vcmd[0], vcmd[1],
                              " ".join(f"{n}:tgt={t:+.3f},q={q:+.3f}"
                                       for n, t, q in active))
 
@@ -236,6 +256,8 @@ class Runtime:
             self._motors.disable_all()
             self._bus.close()
             self._imu.close()
+            if self._joystick is not None:
+                self._joystick.stop()
 
 
 DEPLOY_DIR = Path(__file__).resolve().parent / "scripts" / "deploy"

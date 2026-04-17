@@ -1,6 +1,11 @@
 """IMU serial driver for HI226/HI229 (or compatible) AHRS module.
 
-Protocol parsing adapted from the hardware-tested ``imu_receiver.py``.
+Runs a dedicated reader thread at the IMU's native streaming rate
+(up to 400 Hz). The thread parses every TYPE_IMU + TYPE_AHRS pair and
+publishes the transformed result into a lock-protected snapshot.
+``read()`` returns the latest snapshot non-blockingly, so the policy tick
+(50 Hz) and any future high-rate consumer (e.g. motor thread at 600 Hz)
+always see the freshest sample the hardware has produced.
 
 The runtime expects:
 
@@ -21,6 +26,7 @@ from __future__ import annotations
 import logging
 import math
 import struct
+import threading
 import numpy as np
 import serial
 from serial import EIGHTBITS, PARITY_NONE, STOPBITS_ONE
@@ -90,7 +96,8 @@ class Imu:
         self,
         port: str = DEFAULT_PORT,
         baudrate: int = DEFAULT_BAUD,
-        timeout: float = 1.0,
+        timeout: float = 0.05,
+        first_sample_timeout: float = 2.0,
     ) -> None:
         self._serial = serial.Serial(
             port=port,
@@ -102,26 +109,61 @@ class Imu:
         )
         log.info("IMU opened on %s @ %d baud", port, baudrate)
 
+        # Latest published sample (root frame).  Default is "stationary,
+        # level" so an early read() before the first frame is harmless.
+        self._ang_vel = np.zeros(3, dtype=np.float32)
+        self._proj_g  = np.array([0.0, 0.0, -1.0], dtype=np.float32)
+        self._yaw     = 0.0
+        self._sample_count = 0
+
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._first_sample = threading.Event()
+
+        self._thread = threading.Thread(
+            target=self._poll_loop, daemon=True, name="imu-reader",
+        )
+        self._thread.start()
+
+        # Wait briefly for the first real sample so the policy's first
+        # observation isn't based on the zero default.
+        if not self._first_sample.wait(timeout=first_sample_timeout):
+            log.warning("IMU: no sample within %.1f s — using defaults",
+                        first_sample_timeout)
+
+    # -- public API ---------------------------------------------------------
     def read(self) -> tuple[np.ndarray, np.ndarray, float]:
         """Return (ang_vel_root[3], projected_gravity_root[3], yaw_world).
 
-        Blocks until one complete pair of TYPE_IMU + TYPE_AHRS frames is
-        received.  At 921 600 baud the IMU streams well above 200 Hz, so
-        this should return in < 10 ms normally.
+        Non-blocking snapshot of the latest sample produced by the reader
+        thread. Arrays are fresh copies, safe to retain.
         """
+        with self._lock:
+            return self._ang_vel.copy(), self._proj_g.copy(), self._yaw
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=0.5)
+        if self._serial.is_open:
+            self._serial.close()
+            log.info("IMU closed (%d samples)", self._sample_count)
+
+    # -- reader thread ------------------------------------------------------
+    def _poll_loop(self) -> None:
+        ser = self._serial
         got_imu = False
         got_ahrs = False
-
-        # Raw parsed values (IMU frame, before axis remap)
-        accel = np.zeros(3, dtype=np.float32)
         ang_vel_raw = np.zeros(3, dtype=np.float32)
         heading_raw = 0.0
         qw = qx = qy = qz = 0.0
 
-        ser = self._serial
-        while ser.is_open:
-            # Read until frame header 0xFC
-            b = ser.read(1)
+        while not self._stop.is_set() and ser.is_open:
+            try:
+                b = ser.read(1)
+            except (serial.SerialException, OSError) as e:
+                log.warning("IMU serial read failed: %s", e)
+                return
             if len(b) == 0:
                 continue
             if b.hex() != FRAME_HEAD:
@@ -133,25 +175,24 @@ class Imu:
             # Skip SN, CRC8, CRC16 (4 bytes)
             ser.read(4)
 
-            # Read the data payload (length from header) regardless of type,
-            # so the stream stays aligned even for frame types we don't use.
-            data_len = int(check_len, 16)
+            try:
+                data_len = int(check_len, 16)
+            except ValueError:
+                continue
             data = ser.read(data_len)
             if len(data) < data_len:
                 continue
 
             if head_type == TYPE_IMU and check_len == IMU_LEN:
-                imu_vals = struct.unpack("12f ii", data[:56])
-                accel[0] = imu_vals[3]
-                accel[1] = imu_vals[4]
-                accel[2] = imu_vals[5]
+                # Accelerometer is parsed but currently unused by the policy.
+                _ = struct.unpack("12f ii", data[:56])
                 got_imu = True
 
             elif head_type == TYPE_AHRS and check_len == AHRS_LEN:
                 ahrs = struct.unpack("10f ii", data[:48])
-                ang_vel_raw[0] = ahrs[0]  # roll speed (IMU frame)
-                ang_vel_raw[1] = ahrs[1]  # pitch speed (IMU frame)
-                ang_vel_raw[2] = ahrs[2]  # heading speed (IMU frame)
+                ang_vel_raw[0] = ahrs[0]
+                ang_vel_raw[1] = ahrs[1]
+                ang_vel_raw[2] = ahrs[2]
                 heading_raw = ahrs[5]
                 qw = ahrs[6]
                 qx = ahrs[7]
@@ -159,30 +200,23 @@ class Imu:
                 qz = ahrs[9]
                 got_ahrs = True
 
-            if got_imu and got_ahrs:
-                break
+            if not (got_imu and got_ahrs):
+                continue
+            got_imu = False
+            got_ahrs = False
 
-        # --- Transform from IMU frame to robot root frame ---
+            # --- Transform IMU → robot root frame ---
+            if not np.all(np.isfinite(ang_vel_raw)):
+                log.warning("non-finite IMU angular velocity — zeroed")
+                ang_vel_raw = np.zeros(3, dtype=np.float32)
 
-        # Guard against corrupt serial frames: a single bad frame must not
-        # leak NaN/inf into the control loop.
-        if not np.all(np.isfinite(ang_vel_raw)):
-            log.warning("non-finite IMU angular velocity — zeroed")
-            ang_vel_raw = np.zeros(3, dtype=np.float32)
+            ang_vel = self.R_base_from_imu @ ang_vel_raw
+            proj_g_imu = _projected_gravity_from_quat(qw, qx, qy, qz)
+            proj_g = self.R_base_from_imu @ proj_g_imu
 
-        # Angular velocity: rotate into robot frame
-        ang_vel = self.R_base_from_imu @ ang_vel_raw
-
-        # Projected gravity: compute in IMU frame from quaternion, then rotate
-        proj_g_imu = _projected_gravity_from_quat(qw, qx, qy, qz)
-        proj_g = self.R_base_from_imu @ proj_g_imu
-
-        # Yaw is rotation about Z, which is the same axis in both frames
-        yaw_w = heading_raw
-
-        return ang_vel, proj_g, float(yaw_w)
-
-    def close(self) -> None:
-        if self._serial.is_open:
-            self._serial.close()
-            log.info("IMU closed")
+            with self._lock:
+                self._ang_vel = ang_vel.astype(np.float32)
+                self._proj_g  = proj_g.astype(np.float32)
+                self._yaw     = float(heading_raw)
+                self._sample_count += 1
+            self._first_sample.set()
