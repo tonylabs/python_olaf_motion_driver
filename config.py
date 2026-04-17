@@ -109,3 +109,7 @@ GAIT_PERIOD_S   = 0.6                       # must match ObsTerm gait_phase para
 # Safety
 POLICY_WATCHDOG_S = 0.040                   # drop to damping if policy misses
 KP_RAMP_S         = 2.0                     # soft-start ramp on startup
+
+# Slow-motion debug: per-joint velocity cap applied to the policy target
+# before it's published to the motor thread. Enabled via `run.py --slomo`.
+SLOMO_VMAX_RAD_S  = 0.5

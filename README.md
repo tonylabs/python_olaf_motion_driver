@@ -56,3 +56,38 @@ python run.py --policy-dir deploy/
 control to the policy. Watchdog drops to damping if a policy tick takes
 longer than 40 ms. Hardware E-stop on the motor power rail is mandatory — do
 not rely on CAN disable.
+
+## Debug flags
+
+Three flags on `run.py` for bring-up work. They compose — `--slomo --joints …`
+is the normal way to first move a single joint under the policy.
+
+| Flag | Purpose |
+|------|---------|
+| `--slomo` | Clamp per-joint target slew to `config.SLOMO_VMAX_RAD_S` (default 0.5 rad/s) before publishing to the motor thread. Applied after the per-joint active mask so the clamp sees the delta the motors will actually execute. |
+| `--joints NAMES` | Comma-separated joint names or indices (e.g. `l_hip_yaw,r_knee_pitch` or `0,9`). Listed joints track the policy; all others hold at `DEFAULT_JOINT_POS` with normal kp (robot stays propped up). Names accept the `_joint` suffix or the short form. Default: all 12. |
+| `--log-level` | Standard `logging` level. Use `INFO` (default) for normal runs — `DEBUG` floods the terminal with per-frame SocketCAN traces. |
+
+Examples:
+
+```bash
+python run.py --slomo --joints l_knee_pitch                  # one joint, slowly
+python run.py --joints l_ankle_pitch,l_ankle_roll,r_ankle_pitch,r_ankle_roll
+python run.py --slomo                                        # all joints, slow
+```
+
+### Non-finite guards
+
+Two guards prevent a single bad serial frame or NaN from the policy from
+crashing the motor thread:
+
+- **IMU (`imu.py`)**: quaternion with zero/non-finite/out-of-range norm falls
+  back to `(0, 0, −1)` projected gravity; non-finite angular velocity is
+  zeroed. Logs a warning.
+- **Motor loop (`run.py`)**: if the interpolated target is non-finite, the
+  LPF is reset to the measured joint positions and the tick falls through to
+  `damp_all()` — same policy as the watchdog path.
+
+If you see `non-finite IMU angular velocity` or `non-finite target, damping
+this tick` warnings, the IMU serial parser is desyncing; the loop will keep
+running but the root cause is upstream.

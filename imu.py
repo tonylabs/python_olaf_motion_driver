@@ -19,6 +19,7 @@ vectors into the robot root frame.  The remapping is:
 from __future__ import annotations
 
 import logging
+import math
 import struct
 import numpy as np
 import serial
@@ -61,7 +62,13 @@ def _projected_gravity_from_quat(qw: float, qx: float,
     """Compute R_world→body @ [0,0,-1] from a body-to-world quaternion.
 
     The third column of R(q) is R @ [0,0,1], so R^T @ [0,0,-1] = −col_2(R).
+    Returns the canonical "gravity straight down" if the quaternion is
+    malformed (zero norm or non-finite), since a bad serial frame must not
+    be allowed to poison the control loop with NaN/inf.
     """
+    norm_sq = qw * qw + qx * qx + qy * qy + qz * qz
+    if not math.isfinite(norm_sq) or norm_sq < 1e-6 or norm_sq > 4.0:
+        return np.array([0.0, 0.0, -1.0], dtype=np.float32)
     col2 = np.array([
         2.0 * (qx * qz + qw * qy),
         2.0 * (qy * qz - qw * qx),
@@ -156,6 +163,12 @@ class Imu:
                 break
 
         # --- Transform from IMU frame to robot root frame ---
+
+        # Guard against corrupt serial frames: a single bad frame must not
+        # leak NaN/inf into the control loop.
+        if not np.all(np.isfinite(ang_vel_raw)):
+            log.warning("non-finite IMU angular velocity — zeroed")
+            ang_vel_raw = np.zeros(3, dtype=np.float32)
 
         # Angular velocity: rotate into robot frame
         ang_vel = self.R_base_from_imu @ ang_vel_raw
