@@ -13,12 +13,18 @@ from pathlib import Path
 import numpy as np
 import onnxruntime as ort
 
+# Suppress GPU device discovery warning on systems without a GPU (e.g. Raspberry Pi)
+ort.set_default_logger_severity(3)
+
 
 class DeployedPolicy:
     def __init__(self, policy_dir: Path | str, providers: tuple[str, ...] = ("CPUExecutionProvider",)):
         policy_dir = Path(policy_dir)
+        opts = ort.SessionOptions()
+        opts.log_severity_level = 3
         self._session = ort.InferenceSession(
             str(policy_dir / "policy.onnx"),
+            sess_options=opts,
             providers=list(providers),
         )
         self._input_name = self._session.get_inputs()[0].name

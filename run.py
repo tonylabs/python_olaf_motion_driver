@@ -14,15 +14,19 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import signal
 import threading
 import time
 from pathlib import Path
 
+# Suppress ONNX Runtime GPU discovery warning on headless / GPU-less boards
+os.environ.setdefault("ORT_DISABLE_GPU_DEVICE_ENUMERATION", "1")
+
 import numpy as np
 
-from .can_bus import CanBus
-from .config import (
+from can_bus import CanBus
+from config import (
     DEFAULT_JOINT_POS,
     JOINT_ORDER,
     KP_RAMP_S,
@@ -32,10 +36,10 @@ from .config import (
     POLICY_DT,
     POLICY_WATCHDOG_S,
 )
-from .imu import Imu
-from .motors import MotorBus
-from .observation import ObservationBuilder, OBS_DIM
-from .policy import DeployedPolicy
+from imu import Imu
+from motors import MotorBus
+from observation import ObservationBuilder, OBS_DIM
+from policy import DeployedPolicy
 
 log = logging.getLogger("olaf.run")
 
@@ -57,9 +61,9 @@ class FirstOrderLowPass:
 
 
 class Runtime:
-    def __init__(self, policy_dir: Path, can_channel: str = "can0"):
+    def __init__(self, policy_dir: Path, can_channel: str = "can_usb"):
         self._bus = CanBus(channel=can_channel, bitrate=1_000_000)
-        self._motors = MotorBus(self._bus)
+        self._motors = MotorBus(self._bus, dm_channel=can_channel)
         self._imu = Imu()
         self._policy = DeployedPolicy(policy_dir)
         self._obs_builder = ObservationBuilder()
@@ -113,22 +117,12 @@ class Runtime:
 
     # -- policy tick (50 Hz) -----------------------------------------------
     def _policy_tick(self) -> None:
-        ang_vel, proj_g, yaw_w = self._imu.read()
+        ang_vel, proj_g, _yaw_w = self._imu.read()
         q  = self._motors.joint_pos
         qd = self._motors.joint_vel
 
-        # Torso world xy — not directly observable without state estimation.
-        # Approximate with path-frame origin (robot-relative motion).
-        torso_xy = np.zeros(2, dtype=np.float32)
-
-        # base_lin_vel in root frame — leave zero unless you have a KF.
-        base_lin_vel = np.zeros(3, dtype=np.float32)
-
         obs = self._obs_builder.build(
             velocity_cmd=self._velocity_cmd,
-            torso_xy_world=torso_xy,
-            yaw_world=yaw_w,
-            base_lin_vel_root=base_lin_vel,
             base_ang_vel_root=ang_vel,
             projected_gravity=proj_g,
             joint_pos=q,
@@ -150,8 +144,7 @@ class Runtime:
     # -- lifecycle ----------------------------------------------------------
     def run(self) -> None:
         self._motors.enable_all()
-        self._motors.command(DEFAULT_JOINT_POS, np.zeros(N_JOINTS, dtype=np.float32),
-                             kp_scale=0.0)
+        self._motors.command(DEFAULT_JOINT_POS, np.zeros(N_JOINTS, dtype=np.float32), kp_scale=0.0)
 
         mot = threading.Thread(target=self._motor_loop, daemon=True)
         mot.start()
@@ -187,11 +180,15 @@ class Runtime:
             self._imu.close()
 
 
+DEPLOY_DIR = Path(__file__).resolve().parent / "scripts" / "deploy"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--policy-dir", required=True, type=Path,
-                        help="Directory with policy.onnx + preprocessor.json")
-    parser.add_argument("--can", default="can0")
+    parser.add_argument("--policy-dir", type=Path, default=DEPLOY_DIR,
+                        help="Directory with policy.onnx + preprocessor.json "
+                             "(default: scripts/deploy/)")
+    parser.add_argument("--can", default="can_usb")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
     logging.basicConfig(level=args.log_level,

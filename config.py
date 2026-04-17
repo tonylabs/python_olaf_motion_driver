@@ -4,10 +4,8 @@ Keep in sync with ``olaf_walking_env_cfg.py``.  The ORDER of ``JOINT_ORDER``
 is the contract between policy outputs, observations, and motor commands.
 """
 from __future__ import annotations
-
 from dataclasses import dataclass
 from enum import Enum
-
 import numpy as np
 
 
@@ -33,8 +31,8 @@ N_JOINTS = len(JOINT_ORDER)
 # Default joint targets — action = raw_action + DEFAULT_JOINT_POS (scale=1.0,
 # use_default_offset=True).  Must match init_state.joint_pos in env.
 DEFAULT_JOINT_POS = np.array([
-    0.00, -0.10,  0.90,  1.65,  0.70,  0.00,   # left leg
-    0.00, -0.10, -0.90, -1.65,  0.70,  0.00,   # right leg
+    0.00, 0.0,  0.50,  1.31,  0.80,  0.00,   # left leg
+    0.00, 0.0, -0.50, -1.31,  0.80,  0.00,   # right leg
 ], dtype=np.float32)
 
 # URDF joint limits (lower, upper) in the same order as JOINT_ORDER.
@@ -60,7 +58,7 @@ JOINT_LIMITS = np.array([
 class MotorKind(Enum):
     ROBSTRIDE_RS02 = "rs02"   # hip yaw
     ROBSTRIDE_RS03 = "rs03"   # hip roll/pitch, knee
-    DAMIAO_J4340   = "dm4340" # ankle pitch
+    DAMIAO_J4340P  = "dm4340p" # ankle pitch
     DAMIAO_J4310   = "dm4310" # ankle roll
 
 
@@ -72,36 +70,29 @@ class MotorSpec:
     zero_offset_rad: float = 0.0  # mechanical zero offset (encoder − URDF zero)
     kp: float = 0.0
     kd: float = 0.0
+    # Damiao-specific: master_id (master_id) and motor_type string for
+    # the damiao-motor library.  Ignored for Robstride motors.
+    master_id: int = 0
+    dm_type: str = ""
 
 
-# ------------------ FILL IN WITH YOUR WIRING ------------------
-# Example IDs — replace with your actual assignments.  Order does NOT matter
-# in this dict; lookup is by joint name.
+# ---------------------------------------------------------------------------
+# Motor wiring — IDs match the tested all_homing.py layout.
+# ---------------------------------------------------------------------------
 MOTOR_TABLE: dict[str, MotorSpec] = {
-    "l_hip_yaw_joint":     MotorSpec(can_id=0x11, kind=MotorKind.ROBSTRIDE_RS02,
-                                     kp=40.0, kd=1.0),
-    "l_hip_roll_joint":    MotorSpec(can_id=0x12, kind=MotorKind.ROBSTRIDE_RS03,
-                                     kp=50.0, kd=2.0),
-    "l_hip_pitch_joint":   MotorSpec(can_id=0x13, kind=MotorKind.ROBSTRIDE_RS03,
-                                     kp=80.0, kd=4.0),
-    "l_knee_pitch_joint":  MotorSpec(can_id=0x14, kind=MotorKind.ROBSTRIDE_RS03,
-                                     kp=80.0, kd=4.0),
-    "l_ankle_pitch_joint": MotorSpec(can_id=0x15, kind=MotorKind.DAMIAO_J4340,
-                                     kp=30.0, kd=2.0),
-    "l_ankle_roll_joint":  MotorSpec(can_id=0x16, kind=MotorKind.DAMIAO_J4310,
-                                     kp=8.0,  kd=2.0),
-    "r_hip_yaw_joint":     MotorSpec(can_id=0x21, kind=MotorKind.ROBSTRIDE_RS02,
-                                     kp=40.0, kd=1.0),
-    "r_hip_roll_joint":    MotorSpec(can_id=0x22, kind=MotorKind.ROBSTRIDE_RS03,
-                                     kp=50.0, kd=2.0),
-    "r_hip_pitch_joint":   MotorSpec(can_id=0x23, kind=MotorKind.ROBSTRIDE_RS03,
-                                     kp=80.0, kd=4.0),
-    "r_knee_pitch_joint":  MotorSpec(can_id=0x24, kind=MotorKind.ROBSTRIDE_RS03,
-                                     kp=80.0, kd=4.0),
-    "r_ankle_pitch_joint": MotorSpec(can_id=0x25, kind=MotorKind.DAMIAO_J4340,
-                                     kp=30.0, kd=2.0),
-    "r_ankle_roll_joint":  MotorSpec(can_id=0x26, kind=MotorKind.DAMIAO_J4310,
-                                     kp=8.0,  kd=2.0),
+    "l_hip_yaw_joint":     MotorSpec(can_id=1,  kind=MotorKind.ROBSTRIDE_RS02, kp=12.0, kd=1.5),
+    "l_hip_roll_joint":    MotorSpec(can_id=2,  kind=MotorKind.ROBSTRIDE_RS03, kp=45.0, kd=6.0),
+    "l_hip_pitch_joint":   MotorSpec(can_id=3,  kind=MotorKind.ROBSTRIDE_RS03, kp=45.0, kd=6.0),
+    "l_knee_pitch_joint":  MotorSpec(can_id=4,  kind=MotorKind.ROBSTRIDE_RS03, kp=45.0, kd=6.0),
+    "l_ankle_pitch_joint": MotorSpec(can_id=5,  kind=MotorKind.DAMIAO_J4340P,  kp=30.0, kd=4.0, master_id=1, dm_type="4340P"),
+    "l_ankle_roll_joint":  MotorSpec(can_id=6,  kind=MotorKind.DAMIAO_J4310,   kp=15.0, kd=1.5, master_id=2, dm_type="4310"),
+
+    "r_hip_yaw_joint":     MotorSpec(can_id=7,  kind=MotorKind.ROBSTRIDE_RS02, kp=12.0, kd=1.5),
+    "r_hip_roll_joint":    MotorSpec(can_id=8,  kind=MotorKind.ROBSTRIDE_RS03, kp=45.0, kd=6.0),
+    "r_hip_pitch_joint":   MotorSpec(can_id=9,  kind=MotorKind.ROBSTRIDE_RS03, kp=45.0, kd=6.0),
+    "r_knee_pitch_joint":  MotorSpec(can_id=10, kind=MotorKind.ROBSTRIDE_RS03, kp=45.0, kd=6.0),
+    "r_ankle_pitch_joint": MotorSpec(can_id=11, kind=MotorKind.DAMIAO_J4340P,  kp=30.0, kd=4.0, master_id=3, dm_type="4340P"),
+    "r_ankle_roll_joint":  MotorSpec(can_id=12, kind=MotorKind.DAMIAO_J4310,   kp=15.0, kd=1.5, master_id=4, dm_type="4310"),
 }
 
 

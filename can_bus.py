@@ -23,7 +23,7 @@ class CanFrame:
 
 
 class CanBus:
-    def __init__(self, channel: str = "can0", bitrate: int = 1_000_000):
+    def __init__(self, channel: str = "can_usb", bitrate: int = 1_000_000):
         self._bus = can.interface.Bus(
             channel=channel,
             interface="socketcan",

@@ -1,31 +1,34 @@
-"""MIT-mode CAN drivers for Robstride RS02/RS03 and Damiao DM-J43xx.
+"""Motor drivers for Robstride RS02/RS03 and Damiao DM-J43xx.
 
-Both families use the MIT impedance command:
-
-    τ = Kp·(q_des − q) + Kd·(q̇_des − q̇) + τ_ff
-
-packed into 8 CAN bytes.  Per-family constants (ID format, scaling ranges)
-differ and are in ``_SPEC`` tables below.  **Verify these against your
-firmware manual before enabling torque** — vendors ship revisions that
-change the ranges.
+Robstride motors use raw MIT-mode CAN frames via CanBus.
+Damiao motors use the ``damiao-motor`` library (``DaMiaoController``),
+which manages its own CAN bus connection and background feedback polling.
 """
 from __future__ import annotations
 
-import struct
+import logging
 import time
 from dataclasses import dataclass
 
 import numpy as np
+from damiao_motor import DaMiaoController
 
-from .can_bus import CanBus, CanFrame
-from .config import MotorKind, MotorSpec, MOTOR_TABLE, JOINT_ORDER, N_JOINTS
+from can_bus import CanBus, CanFrame
+from config import MotorKind, MotorSpec, MOTOR_TABLE, JOINT_ORDER, N_JOINTS
+
+log = logging.getLogger("olaf.motors")
+
+# Robstride motor kinds (use raw CAN MIT frames)
+_RS_KINDS = (MotorKind.ROBSTRIDE_RS02, MotorKind.ROBSTRIDE_RS03)
+# Damiao motor kinds (use damiao-motor library)
+_DM_KINDS = (MotorKind.DAMIAO_J4340P, MotorKind.DAMIAO_J4310)
 
 
 # ---------------------------------------------------------------------------
-# Per-family packing ranges  (pos_rad, vel_rad_s, kp, kd, tau_Nm)
+# Robstride MIT-mode helpers (unchanged from original)
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
-class _Spec:
+class _RobstrideSpec:
     p_lim: float
     v_lim: float
     kp_lim: float
@@ -33,21 +36,12 @@ class _Spec:
     t_lim: float
 
 
-_SPEC: dict[MotorKind, _Spec] = {
-    # Robstride uses the "CyberGear"-style ranges.  RS02/RS03 share the
-    # position/kp/kd ranges; velocity and torque differ by model.
-    MotorKind.ROBSTRIDE_RS02: _Spec(p_lim=12.5, v_lim=42.0, kp_lim=500.0, kd_lim=5.0, t_lim=17.0),
-    MotorKind.ROBSTRIDE_RS03: _Spec(p_lim=12.5, v_lim=20.4, kp_lim=500.0, kd_lim=5.0, t_lim=60.0),
-    # Damiao default MIT ranges.  Check the DIP-switch / RID config on
-    # each motor — some shipments come with p_lim=3.14.
-    MotorKind.DAMIAO_J4340:   _Spec(p_lim=12.5, v_lim= 8.0, kp_lim=500.0, kd_lim=5.0, t_lim=27.0),
-    MotorKind.DAMIAO_J4310:   _Spec(p_lim=12.5, v_lim=30.0, kp_lim=500.0, kd_lim=5.0, t_lim=7.0),
+_RS_SPEC: dict[MotorKind, _RobstrideSpec] = {
+    MotorKind.ROBSTRIDE_RS02: _RobstrideSpec(p_lim=12.5, v_lim=42.0, kp_lim=500.0, kd_lim=5.0, t_lim=17.0),
+    MotorKind.ROBSTRIDE_RS03: _RobstrideSpec(p_lim=12.5, v_lim=20.4, kp_lim=500.0, kd_lim=5.0, t_lim=60.0),
 }
 
 
-# ---------------------------------------------------------------------------
-# Bit-packing helpers
-# ---------------------------------------------------------------------------
 def _float_to_uint(x: float, x_min: float, x_max: float, bits: int) -> int:
     x = max(min(x, x_max), x_min)
     span = x_max - x_min
@@ -60,8 +54,7 @@ def _uint_to_float(u: int, x_min: float, x_max: float, bits: int) -> float:
 
 
 def _pack_mit(pos: float, vel: float, kp: float, kd: float, tau_ff: float,
-              spec: _Spec) -> bytes:
-    """Pack MIT command: pos 16b | vel 12b | kp 12b | kd 12b | tau 12b."""
+              spec: _RobstrideSpec) -> bytes:
     p = _float_to_uint(pos,   -spec.p_lim, +spec.p_lim, 16)
     v = _float_to_uint(vel,   -spec.v_lim, +spec.v_lim, 12)
     k = _float_to_uint(kp,     0.0,        spec.kp_lim, 12)
@@ -79,8 +72,7 @@ def _pack_mit(pos: float, vel: float, kp: float, kd: float, tau_ff: float,
     ])
 
 
-def _unpack_mit_reply(data: bytes, spec: _Spec) -> tuple[float, float, float]:
-    """Decode (pos, vel, tau) from an MIT reply (Damiao/Robstride share layout)."""
+def _unpack_mit_reply(data: bytes, spec: _RobstrideSpec) -> tuple[float, float, float]:
     p = (data[1] << 8) | data[2]
     v = (data[3] << 4) | (data[4] >> 4)
     t = ((data[4] & 0x0F) << 8) | data[5]
@@ -91,58 +83,42 @@ def _unpack_mit_reply(data: bytes, spec: _Spec) -> tuple[float, float, float]:
     )
 
 
-# ---------------------------------------------------------------------------
-# Frame builders — family-specific IDs
-# ---------------------------------------------------------------------------
 def _robstride_frame(motor_id: int, payload: bytes, cmd_type: int) -> CanFrame:
-    """Robstride 29-bit extended ID: [type:5][0:16][host:8][motor:8]."""
     host_id = 0xFD
     arb = (cmd_type & 0x1F) << 24 | (host_id & 0xFF) << 8 | (motor_id & 0xFF)
     return CanFrame(arbitration_id=arb, data=payload, is_extended_id=True)
-
-
-def _damiao_frame(motor_id: int, payload: bytes) -> CanFrame:
-    """Damiao: 11-bit standard ID equal to the motor's CAN ID."""
-    return CanFrame(arbitration_id=motor_id, data=payload, is_extended_id=False)
-
-
-def _build_command(spec_m: MotorSpec, q: float, qd: float,
-                   kp: float, kd: float, tau_ff: float) -> CanFrame:
-    spec = _SPEC[spec_m.kind]
-    q_cmd  = q  * spec_m.direction + spec_m.zero_offset_rad
-    qd_cmd = qd * spec_m.direction
-    payload = _pack_mit(q_cmd, qd_cmd, kp, kd, tau_ff, spec)
-    if spec_m.kind in (MotorKind.ROBSTRIDE_RS02, MotorKind.ROBSTRIDE_RS03):
-        return _robstride_frame(spec_m.can_id, payload, cmd_type=0x01)
-    return _damiao_frame(spec_m.can_id, payload)
-
-
-def _enable_frame(spec_m: MotorSpec) -> CanFrame:
-    if spec_m.kind in (MotorKind.ROBSTRIDE_RS02, MotorKind.ROBSTRIDE_RS03):
-        # Robstride enable: cmd type 0x03, empty payload
-        return _robstride_frame(spec_m.can_id, bytes(8), cmd_type=0x03)
-    # Damiao enable: 0xFF * 7 + 0xFC
-    return _damiao_frame(spec_m.can_id, bytes([0xFF] * 7 + [0xFC]))
-
-
-def _disable_frame(spec_m: MotorSpec) -> CanFrame:
-    if spec_m.kind in (MotorKind.ROBSTRIDE_RS02, MotorKind.ROBSTRIDE_RS03):
-        return _robstride_frame(spec_m.can_id, bytes(8), cmd_type=0x04)
-    return _damiao_frame(spec_m.can_id, bytes([0xFF] * 7 + [0xFD]))
 
 
 # ---------------------------------------------------------------------------
 # MotorBus — vectorised interface used by run.py
 # ---------------------------------------------------------------------------
 class MotorBus:
-    """Thin coordinator — sends N_JOINTS commands per tick, reads replies
-    whenever the bus is drained (best-effort, non-blocking).
+    """Coordinates Robstride (raw CAN) and Damiao (damiao-motor library)
+    motors behind a single vectorised interface.
     """
 
-    def __init__(self, bus: CanBus):
-        self._bus = bus
+    def __init__(self, rs_bus: CanBus, dm_channel: str = "can_usb"):
+        self._rs_bus = rs_bus
         self._specs = [MOTOR_TABLE[name] for name in JOINT_ORDER]
-        self._id_to_idx = {s.can_id: i for i, s in enumerate(self._specs)}
+
+        # --- Robstride bookkeeping ---
+        self._rs_id_to_idx: dict[int, int] = {}
+        for i, s in enumerate(self._specs):
+            if s.kind in _RS_KINDS:
+                self._rs_id_to_idx[s.can_id] = i
+
+        # --- Damiao: set up via damiao-motor library ---
+        self._dm_ctrl = DaMiaoController(channel=dm_channel, bustype="socketcan")
+        self._dm_motors: dict[int, object] = {}   # idx → DaMiaoMotor
+        for i, s in enumerate(self._specs):
+            if s.kind in _DM_KINDS:
+                motor = self._dm_ctrl.add_motor(
+                    motor_id=s.can_id,
+                    master_id=s.master_id,
+                    motor_type=s.dm_type,
+                )
+                self._dm_motors[i] = motor
+
         # Latest feedback (URDF-frame, after undoing direction/offset)
         self._pos = np.zeros(N_JOINTS, dtype=np.float32)
         self._vel = np.zeros(N_JOINTS, dtype=np.float32)
@@ -150,67 +126,105 @@ class MotorBus:
 
     # -- lifecycle ----------------------------------------------------------
     def enable_all(self) -> None:
+        # Robstride: send enable frame
         for s in self._specs:
-            self._bus.send(_enable_frame(s))
+            if s.kind in _RS_KINDS:
+                frame = _robstride_frame(s.can_id, bytes(8), cmd_type=0x03)
+                self._rs_bus.send(frame)
+                time.sleep(0.002)
+        # Damiao: enable via library
+        for motor in self._dm_motors.values():
+            motor.enable()
             time.sleep(0.002)
 
     def disable_all(self) -> None:
         for s in self._specs:
+            if s.kind in _RS_KINDS:
+                try:
+                    frame = _robstride_frame(s.can_id, bytes(8), cmd_type=0x04)
+                    self._rs_bus.send(frame)
+                except Exception:
+                    pass
+        for motor in self._dm_motors.values():
             try:
-                self._bus.send(_disable_frame(s))
+                motor.disable()
             except Exception:
                 pass
 
     # -- command ------------------------------------------------------------
     def command(self, q_des: np.ndarray, qd_des: np.ndarray,
                 kp_scale: float = 1.0) -> None:
-        """Send one MIT command per joint.  ``q_des`` / ``qd_des`` are in
-        URDF frame and JOINT_ORDER order.  ``kp_scale`` in [0,1] lets the
-        caller soft-start (ramp from 0 → 1).
-        """
         for i, s in enumerate(self._specs):
-            frame = _build_command(
-                s,
-                q=float(q_des[i]),
-                qd=float(qd_des[i]),
-                kp=s.kp * kp_scale,
-                kd=s.kd,
-                tau_ff=0.0,
-            )
-            self._bus.send(frame)
+            q_cmd = float(q_des[i]) * s.direction + s.zero_offset_rad
+            qd_cmd = float(qd_des[i]) * s.direction
+            kp = s.kp * kp_scale
+            kd = s.kd
+
+            if s.kind in _RS_KINDS:
+                spec = _RS_SPEC[s.kind]
+                payload = _pack_mit(q_cmd, qd_cmd, kp, kd, 0.0, spec)
+                self._rs_bus.send(
+                    _robstride_frame(s.can_id, payload, cmd_type=0x01)
+                )
+            else:
+                self._dm_motors[i].send_cmd_mit(
+                    target_position=q_cmd,
+                    target_velocity=qd_cmd,
+                    stiffness=kp,
+                    damping=kd,
+                    feedforward_torque=0.0,
+                )
 
     def damp_all(self) -> None:
-        """Kp=0, Kd=nominal — safe fallback pose."""
-        for s in self._specs:
-            frame = _build_command(s, q=0.0, qd=0.0, kp=0.0, kd=s.kd, tau_ff=0.0)
-            self._bus.send(frame)
+        for i, s in enumerate(self._specs):
+            if s.kind in _RS_KINDS:
+                spec = _RS_SPEC[s.kind]
+                payload = _pack_mit(0.0, 0.0, 0.0, s.kd, 0.0, spec)
+                self._rs_bus.send(
+                    _robstride_frame(s.can_id, payload, cmd_type=0x01)
+                )
+            else:
+                self._dm_motors[i].send_cmd_mit(
+                    target_position=0.0,
+                    target_velocity=0.0,
+                    stiffness=0.0,
+                    damping=s.kd,
+                    feedforward_torque=0.0,
+                )
 
     # -- feedback -----------------------------------------------------------
     def pump_feedback(self, budget_s: float = 0.001) -> None:
-        """Drain pending CAN frames for up to ``budget_s`` and update state."""
+        """Drain pending CAN frames and update state."""
+        # Robstride: drain from raw bus
         deadline = time.monotonic() + budget_s
         while time.monotonic() < deadline:
-            frame = self._bus.recv(timeout=0.0)
+            frame = self._rs_bus.recv(timeout=0.0)
             if frame is None:
-                return
-            self._ingest(frame)
+                break
+            self._ingest_robstride(frame)
 
-    def _ingest(self, frame: CanFrame) -> None:
-        # Robstride replies carry motor_id in byte[1] of the ID; Damiao in
-        # arbitration_id itself.  This is intentionally permissive — if your
-        # adapter strips extended-ID metadata, adjust here.
-        if frame.is_extended_id:
-            motor_id = (frame.arbitration_id >> 8) & 0xFF  # Robstride
-        else:
-            # Damiao replies arrive on (motor_id + 0x10) by default
-            motor_id = frame.arbitration_id & 0x0F
-        idx = self._id_to_idx.get(motor_id)
+        # Damiao: read latest state from library (background thread polls)
+        self._dm_ctrl.poll_feedback()
+        for idx, motor in self._dm_motors.items():
+            spec_m = self._specs[idx]
+            state = motor.state
+            p = state.get("pos", 0.0)
+            v = state.get("vel", 0.0)
+            t = state.get("torq", 0.0)
+            self._pos[idx] = (p - spec_m.zero_offset_rad) * spec_m.direction
+            self._vel[idx] = v * spec_m.direction
+            self._tau[idx] = t * spec_m.direction
+
+    def _ingest_robstride(self, frame: CanFrame) -> None:
+        if not frame.is_extended_id:
+            return
+        motor_id = (frame.arbitration_id >> 8) & 0xFF
+        idx = self._rs_id_to_idx.get(motor_id)
         if idx is None or len(frame.data) < 6:
             return
         spec_m = self._specs[idx]
-        spec = _SPEC[spec_m.kind]
+        spec = _RS_SPEC[spec_m.kind]
         p, v, t = _unpack_mit_reply(frame.data, spec)
-        # Undo direction flip and zero offset → URDF frame
         self._pos[idx] = (p - spec_m.zero_offset_rad) * spec_m.direction
         self._vel[idx] = v * spec_m.direction
         self._tau[idx] = t * spec_m.direction

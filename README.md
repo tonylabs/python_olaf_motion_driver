@@ -6,7 +6,6 @@ Skeleton for deploying a skrl-trained walking policy to a physical OLAF via a US
 
 | File                | Purpose                                                      |
 |---------------------|--------------------------------------------------------------|
-| `export_policy.py`  | skrl `.pt` → ONNX + state-preprocessor stats (JSON)          |
 | `config.py`         | Joint order, default targets, motor types, CAN IDs, limits   |
 | `can_bus.py`        | SocketCAN wrapper over `python-can`                          |
 | `motors.py`         | Robstride RS02/RS03 and Damiao DM-J43xx MIT-mode drivers     |

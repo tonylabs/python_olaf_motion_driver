@@ -9,4 +9,9 @@ dependencies = [
     "python-can",
     "onnxruntime",
     "pyyaml>=6.0.3",
+    "damiao-motor>=1.0.6",
+    "pygame>=2.6.1",
+    "pyserial>=3.5",
+    "tqdm>=4.67.3",
+    "colorama>=0.4.6",
 ]
