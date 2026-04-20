@@ -94,6 +94,8 @@ running but the root cause is upstream.
 
 ## Joystick control
 
+Press Home + Y from the joystick and start pairing process:
+
 `run.py` drives the policy's `velocity_cmd` from an **Xbox One S controller**
 (USB or Bluetooth) via `joystick.py`. The left stick controls linear
 velocity in the robot's base frame (ROS REP-103 convention):
