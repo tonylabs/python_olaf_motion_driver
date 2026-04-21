@@ -24,7 +24,6 @@ from pathlib import Path
 os.environ.setdefault("ORT_DISABLE_GPU_DEVICE_ENUMERATION", "1")
 
 import numpy as np
-from can_bus import CanBus
 from config import (
     DEFAULT_JOINT_POS,
     JOINT_LIMITS,
@@ -63,12 +62,26 @@ class FirstOrderLowPass:
 
 
 class Runtime:
-    def __init__(self, policy_dir: Path, can_channel: str = "can_usb",
+    def __init__(self, policy_dir: Path,
+                 can_usb: str = "can_usb", can_spi: str = "can_spi",
+                 bus: str = "both",
                  slomo: bool = False,
                  active_mask: np.ndarray | None = None,
-                 joystick_max_vel: float = 0.8):
-        self._bus = CanBus(channel=can_channel, bitrate=1_000_000)
-        self._motors = MotorBus(self._bus, dm_channel=can_channel)
+                 joystick_max_vel: float = 0.8,
+                 home_on_start: bool = True,
+                 home_speed: float = 0.3):
+        self._home_on_start = home_on_start
+        self._home_speed = home_speed
+        if bus == "both":
+            active_channels = None
+        elif bus == "usb":
+            active_channels = (can_usb,)
+        elif bus == "spi":
+            active_channels = (can_spi,)
+        else:
+            raise ValueError(f"--bus must be one of usb/spi/both, got {bus!r}")
+        self._motors = MotorBus(can_usb=can_usb, can_spi=can_spi,
+                                active_channels=active_channels)
         self._imu = Imu()
         self._policy = DeployedPolicy(policy_dir)
         self._obs_builder = ObservationBuilder()
@@ -203,6 +216,8 @@ class Runtime:
     # -- lifecycle ----------------------------------------------------------
     def run(self) -> None:
         self._motors.enable_all()
+        if self._home_on_start:
+            self._motors.home(DEFAULT_JOINT_POS, speed=self._home_speed)
         self._motors.command(DEFAULT_JOINT_POS, np.zeros(N_JOINTS, dtype=np.float32), kp_scale=0.0)
 
         mot = threading.Thread(target=self._motor_loop, daemon=True)
@@ -254,7 +269,6 @@ class Runtime:
             self._stop.set()
             mot.join(timeout=0.5)
             self._motors.disable_all()
-            self._bus.close()
             self._imu.close()
             if self._joystick is not None:
                 self._joystick.stop()
@@ -268,11 +282,23 @@ def main() -> None:
     parser.add_argument("--policy-dir", type=Path, default=DEPLOY_DIR,
                         help="Directory with policy.onnx + preprocessor.json "
                              "(default: scripts/deploy/)")
-    parser.add_argument("--can", default="can_usb")
+    parser.add_argument("--can-usb", default="can_usb",
+                        help="CAN channel carrying motor IDs 1-6 (left leg)")
+    parser.add_argument("--can-spi", default="can_spi",
+                        help="CAN channel carrying motor IDs 7-12 (right leg)")
+    parser.add_argument("--bus", choices=("both", "usb", "spi"), default="both",
+                        help="Restrict motor commands to a single CAN bus. "
+                             "The ONNX policy still runs; inactive joints "
+                             "stay at DEFAULT_JOINT_POS in the observation.")
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument("--slomo", action="store_true",
                         help=f"Clamp per-joint target slew to "
                              f"SLOMO_VMAX_RAD_S ({SLOMO_VMAX_RAD_S} rad/s)")
+    parser.add_argument("--no-home", action="store_true",
+                        help="Skip homing every Robstride motor to "
+                             "DEFAULT_JOINT_POS on startup")
+    parser.add_argument("--home-speed", type=float, default=0.3,
+                        help="Max per-joint speed during homing (rad/s)")
     parser.add_argument("--joints",
                         help="Comma-separated joint names (with or without "
                              "'_joint' suffix) or indices to drive from the "
@@ -284,8 +310,12 @@ def main() -> None:
 
     assert len(JOINT_ORDER) == N_JOINTS
     active_mask = _parse_active_mask(args.joints)
-    rt = Runtime(args.policy_dir, can_channel=args.can, slomo=args.slomo,
-                 active_mask=active_mask)
+    rt = Runtime(args.policy_dir,
+                 can_usb=args.can_usb, can_spi=args.can_spi,
+                 bus=args.bus,
+                 slomo=args.slomo, active_mask=active_mask,
+                 home_on_start=not args.no_home,
+                 home_speed=args.home_speed)
     rt.run()
 
 

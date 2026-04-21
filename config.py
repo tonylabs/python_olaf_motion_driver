@@ -56,10 +56,9 @@ JOINT_LIMITS = np.array([
 # Motor hardware classes
 # ---------------------------------------------------------------------------
 class MotorKind(Enum):
+    ROBSTRIDE_RS00 = "rs00"   # ankle pitch/roll
     ROBSTRIDE_RS02 = "rs02"   # hip yaw
     ROBSTRIDE_RS03 = "rs03"   # hip roll/pitch, knee
-    DAMIAO_J4340P  = "dm4340p" # ankle pitch
-    DAMIAO_J4310   = "dm4310" # ankle roll
 
 
 @dataclass(frozen=True)
@@ -70,10 +69,6 @@ class MotorSpec:
     zero_offset_rad: float = 0.0  # mechanical zero offset (encoder − URDF zero)
     kp: float = 0.0
     kd: float = 0.0
-    # Damiao-specific: master_id (master_id) and motor_type string for
-    # the damiao-motor library.  Ignored for Robstride motors.
-    master_id: int = 0
-    dm_type: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -84,15 +79,15 @@ MOTOR_TABLE: dict[str, MotorSpec] = {
     "l_hip_roll_joint":    MotorSpec(can_id=2,  kind=MotorKind.ROBSTRIDE_RS03, kp=45.0, kd=6.0),
     "l_hip_pitch_joint":   MotorSpec(can_id=3,  kind=MotorKind.ROBSTRIDE_RS03, kp=45.0, kd=6.0),
     "l_knee_pitch_joint":  MotorSpec(can_id=4,  kind=MotorKind.ROBSTRIDE_RS03, kp=45.0, kd=6.0),
-    "l_ankle_pitch_joint": MotorSpec(can_id=5,  kind=MotorKind.DAMIAO_J4340P,  kp=30.0, kd=4.0, master_id=1, dm_type="4340P"),
-    "l_ankle_roll_joint":  MotorSpec(can_id=6,  kind=MotorKind.DAMIAO_J4310,   kp=15.0, kd=1.5, master_id=2, dm_type="4310"),
+    "l_ankle_pitch_joint": MotorSpec(can_id=5,  kind=MotorKind.ROBSTRIDE_RS00, kp=30.0, kd=4.0),
+    "l_ankle_roll_joint":  MotorSpec(can_id=6,  kind=MotorKind.ROBSTRIDE_RS00, kp=15.0, kd=1.5),
 
     "r_hip_yaw_joint":     MotorSpec(can_id=7,  kind=MotorKind.ROBSTRIDE_RS02, kp=12.0, kd=1.5),
     "r_hip_roll_joint":    MotorSpec(can_id=8,  kind=MotorKind.ROBSTRIDE_RS03, kp=45.0, kd=6.0),
     "r_hip_pitch_joint":   MotorSpec(can_id=9,  kind=MotorKind.ROBSTRIDE_RS03, kp=45.0, kd=6.0),
     "r_knee_pitch_joint":  MotorSpec(can_id=10, kind=MotorKind.ROBSTRIDE_RS03, kp=45.0, kd=6.0),
-    "r_ankle_pitch_joint": MotorSpec(can_id=11, kind=MotorKind.DAMIAO_J4340P,  kp=30.0, kd=4.0, master_id=3, dm_type="4340P"),
-    "r_ankle_roll_joint":  MotorSpec(can_id=12, kind=MotorKind.DAMIAO_J4310,   kp=15.0, kd=1.5, master_id=4, dm_type="4310"),
+    "r_ankle_pitch_joint": MotorSpec(can_id=11, kind=MotorKind.ROBSTRIDE_RS00, kp=30.0, kd=4.0),
+    "r_ankle_roll_joint":  MotorSpec(can_id=12, kind=MotorKind.ROBSTRIDE_RS00, kp=15.0, kd=1.5),
 }
 
 
@@ -117,3 +112,19 @@ KP_RAMP_S         = 2.0                     # soft-start ramp on startup
 # Slow-motion debug: per-joint velocity cap applied to the policy target
 # before it's published to the motor thread. Enabled via `run.py --slomo`.
 SLOMO_VMAX_RAD_S  = 0.5
+
+# ---------------------------------------------------------------------------
+# CAN-FD
+# ---------------------------------------------------------------------------
+# When True, all outgoing frames (Robstride + Damiao) are promoted to CAN-FD
+# with bitrate-switch enabled. Requires THREE things configured elsewhere:
+#   1. Kernel interface in FD mode:
+#        sudo ip link set can_usb down
+#        sudo ip link set can_usb type can bitrate 1000000 dbitrate 5000000 fd on
+#        sudo ip link set can_usb up txqueuelen 1000
+#   2. Each motor's firmware configured for CAN-FD at the chosen data bitrate
+#      (Robstride + Damiao both support it, but must be enabled per-motor).
+#   3. A CAN adapter that supports FD (CANable at 5 Mbps is fine).
+# Leave False until all three are true — otherwise every send raises.
+CAN_FD_ENABLED    = False
+CAN_FD_DBITRATE   = 5_000_000

@@ -13,13 +13,13 @@ The runtime expects:
     * ``projected_gravity`` — 3-vector, unit-length ``R_world→root · [0,0,-1]``.
     * ``yaw_world``         — float, current world-frame yaw (rad).
 
-Mounting note — the physical IMU is rotated 90° about Z relative to
-``base_link``, so we apply ``R_base_from_imu`` to map IMU-frame
-vectors into the robot root frame.  The remapping is:
+Mounting note — the IMU is rotated 180° about its Y axis relative to
+``base_link`` (matching the reference C++ implementation's
+``trans_axis = (-1, +1, -1)``).  The remapping is:
 
-    robot_x =  imu_y
-    robot_y = -imu_x
-    robot_z =  imu_z
+    robot_x = -imu_x
+    robot_y =  imu_y
+    robot_z = -imu_z
 """
 from __future__ import annotations
 
@@ -84,12 +84,12 @@ def _projected_gravity_from_quat(qw: float, qx: float,
 
 
 class Imu:
-    # 90° Z-rotation: IMU frame → robot base_link frame.
-    # robot_x = imu_y, robot_y = −imu_x, robot_z = imu_z.
+    # IMU frame → robot base_link frame (180° rotation about Y).
+    # robot_x = −imu_x, robot_y = imu_y, robot_z = −imu_z.
     R_base_from_imu: np.ndarray = np.array(
-        [[0, 1, 0],
-         [-1, 0, 0],
-         [0, 0, 1]], dtype=np.float32,
+        [[-1, 0, 0],
+         [0, 1, 0],
+         [0, 0, -1]], dtype=np.float32,
     )
 
     def __init__(
