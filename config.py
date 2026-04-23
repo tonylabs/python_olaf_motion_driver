@@ -31,8 +31,8 @@ N_JOINTS = len(JOINT_ORDER)
 # Default joint targets — action = raw_action + DEFAULT_JOINT_POS (scale=1.0,
 # use_default_offset=True).  Must match init_state.joint_pos in env.
 DEFAULT_JOINT_POS = np.array([
-    0.00, -0.10,  0.90,  1.65,  0.70,  0.00,   # left leg
-    0.00, -0.10, -0.90, -1.65,  0.70,  0.00,   # right leg
+    0.00, -0.10,  0.90,  1.65,  0.75,  0.00,   # left leg
+    0.00, -0.10, -0.90, -1.65,  0.75,  0.00,   # right leg
 ], dtype=np.float32)
 
 # URDF joint limits (lower, upper) in the same order as JOINT_ORDER.
