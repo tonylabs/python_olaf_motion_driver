@@ -36,6 +36,13 @@ import pygame
 _AXIS_LEFT_X = 0
 _AXIS_LEFT_Y = 1
 
+# SDL button indices (Xbox / Xbox One S layout)
+BUTTON_A = 0
+BUTTON_B = 1
+BUTTON_X = 2
+BUTTON_Y = 3
+_TRACKED_BUTTONS = (BUTTON_A, BUTTON_B, BUTTON_X, BUTTON_Y)
+
 
 class Joystick:
     """Background-polled Xbox controller. Exposes a 4-vector
@@ -59,6 +66,8 @@ class Joystick:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._js: pygame.joystick.JoystickType | None = None
+        self._button_prev: dict[int, bool] = {b: False for b in _TRACKED_BUTTONS}
+        self._button_events: list[int] = []
 
     # -- lifecycle ----------------------------------------------------------
     def start(self) -> None:
@@ -71,9 +80,7 @@ class Joystick:
             )
         self._js = pygame.joystick.Joystick(self._device)
         self._js.init()
-
-        self._thread = threading.Thread(target=self._loop, daemon=True,
-                                        name="joystick-poll")
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="joystick-poll")
         self._thread.start()
 
     def stop(self) -> None:
@@ -91,6 +98,13 @@ class Joystick:
         with self._lock:
             return self._cmd.copy()
 
+    def consume_button_events(self) -> list[int]:
+        """Drain and return newly-pressed buttons since last call (edge-triggered)."""
+        with self._lock:
+            events = list(self._button_events)
+            self._button_events.clear()
+            return events
+
     # -- internals ----------------------------------------------------------
     def _apply_deadzone(self, v: float) -> float:
         if abs(v) < self._deadzone:
@@ -102,17 +116,30 @@ class Joystick:
     def _loop(self) -> None:
         assert self._js is not None
         while not self._stop.is_set():
-            pygame.event.pump()   # required for axis values to refresh
+            pygame.event.pump()   # required for axis/button values to refresh
             lx = self._apply_deadzone(self._js.get_axis(_AXIS_LEFT_X))
             ly = self._apply_deadzone(self._js.get_axis(_AXIS_LEFT_Y))
             # SDL: stick up = -1, stick right = +1. Flip both so the robot
             # convention (forward = +vx, left = +vy) matches the user.
             vx = -ly * self._max_v
             vy = -lx * self._max_v
+
+            new_presses: list[int] = []
+            for btn in _TRACKED_BUTTONS:
+                try:
+                    now_down = bool(self._js.get_button(btn))
+                except Exception:
+                    now_down = False
+                if now_down and not self._button_prev[btn]:
+                    new_presses.append(btn)
+                self._button_prev[btn] = now_down
+
             with self._lock:
                 self._cmd[0] = vx
                 self._cmd[1] = vy
                 # wz and heading stay zero — not driven by left stick
+                if new_presses:
+                    self._button_events.extend(new_presses)
             time.sleep(self._dt)
 
 

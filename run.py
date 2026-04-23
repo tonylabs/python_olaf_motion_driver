@@ -1,14 +1,80 @@
-"""Main runtime entry — 50 Hz policy tick, 200 Hz motor tick.
+"""Main runtime entry.
 
-Threads:
-    * MAIN              — policy inference @ 50 Hz, writes q_target
-    * motor thread      — upsamples q_target to 200 Hz, LPF, sends CAN
+Startup procedure (Xbox-compatible controller required):
 
-The two share ``_latest_target`` and ``_last_policy_t`` under a lock.  The
-motor thread holds the hot path; keep Python objects off it.
+    1. Suspend the robot or hold it so the legs hang freely.
+    2. ``python run.py`` — motors enable, legs stay compliant (kp = 0).
+    3. Press **Y** to ramp every joint to ``DEFAULT_JOINT_POS`` (the
+       training-env stance the policy expects).
+    4. Once settled at the default pose, press **B** to hand control over
+       to the ONNX policy. The left stick drives ``velocity_cmd``.
 
-On a non-RT Linux the 200 Hz tick will jitter ~±1 ms. Use a PREEMPT_RT
-kernel and ``chrt -f 90`` for serious work.
+Buttons:
+
+    * **X** — ramp every joint back to 0 rad (URDF zero pose).
+    * **Y** — ramp every joint to ``DEFAULT_JOINT_POS`` (squat pose).
+    * **B** — hand control to the ONNX policy (gated by --pose-tolerance).
+    * **A** — EMERGENCY STOP: latch, damp motors, exit.
+
+Command-line arguments:
+
+    --policy-dir PATH
+        Directory containing ``policy.onnx`` + ``preprocessor.json``.
+        Default: ``scripts/deploy/``.
+
+    --can-usb CHANNEL        (default: ``can_usb``)
+    --can-spi CHANNEL        (default: ``can_spi``)
+        CAN interface names. Left leg (motor IDs 1–6) goes on --can-usb,
+        right leg (IDs 7–12) goes on --can-spi.
+
+    --bus {both,usb,spi}     (default: ``both``)
+        Restrict motor commands to a single CAN bus. The ONNX policy
+        still runs at full dimension; joints on the inactive bus stay
+        pinned at ``DEFAULT_JOINT_POS`` in the observation.
+
+    --log-level LEVEL        (default: ``INFO``)
+        Python logging level (DEBUG / INFO / WARNING / ERROR).
+
+    --pose-speed RAD_S       (default: 0.3)
+        Max per-joint speed when ramping to the zero pose (X) or to
+        ``DEFAULT_JOINT_POS`` (Y). The ramp is *synchronized*: every joint
+        arrives at its goal simultaneously — the joint with the longest
+        travel moves at this speed, shorter-travel joints move slower in
+        proportion.
+
+    --pose-tolerance RAD     (default: 0.15)
+        Max L∞ joint error vs ``DEFAULT_JOINT_POS`` allowed for B to
+        start the policy. Press Y first and wait until it settles.
+
+    --slomo
+        Clamp per-joint target slew during POLICY mode to
+        ``SLOMO_VMAX_RAD_S`` (see ``config.py``). Useful for watching a
+        misbehaving policy at a safe speed.
+
+    --debug
+        After pressing B, run only --debug-actions policy steps, each
+        with the per-joint target delta clamped to ±--debug-dq rad, then
+        terminate cleanly. Use this to verify per-joint rotation axes
+        without risking runaway motion.
+
+    --debug-actions N        (default: 10)
+    --debug-dq RAD           (default: 0.1)
+        Action budget and per-action slew clamp for --debug. Only take
+        effect when --debug is set.
+
+    --joints LIST
+        Comma-separated joint names (with or without the ``_joint``
+        suffix) or indices (0–11) to drive from the policy. Others are
+        held at ``DEFAULT_JOINT_POS``. Default: all 12.
+        Example: ``--joints l_knee_pitch,r_knee_pitch``.
+
+Examples:
+
+    python run.py                                 # normal operation
+    python run.py --debug                         # 10-action axis check
+    python run.py --bus usb                       # left leg only
+    python run.py --slomo --pose-speed 0.15       # cautious first run
+    python run.py --joints l_hip_pitch,r_hip_pitch  # single-joint test
 """
 from __future__ import annotations
 
@@ -18,6 +84,7 @@ import os
 import signal
 import threading
 import time
+from enum import Enum
 from pathlib import Path
 
 # Suppress ONNX Runtime GPU discovery warning on headless / GPU-less boards
@@ -37,12 +104,21 @@ from config import (
     SLOMO_VMAX_RAD_S,
 )
 from imu import Imu
-from joystick import Joystick
+from joystick import BUTTON_A, BUTTON_B, BUTTON_X, BUTTON_Y, Joystick
 from motors import MotorBus
 from observation import ObservationBuilder, OBS_DIM
 from policy import DeployedPolicy
 
 log = logging.getLogger("olaf.run")
+
+ZERO_JOINT_POS = np.zeros(N_JOINTS, dtype=np.float32)
+
+
+class Mode(Enum):
+    IDLE = "IDLE"                 # legs hang, kp=0 (motors enabled, no stiffness)
+    MOVE_ZERO = "MOVE_ZERO"       # ramp to all-zeros pose
+    MOVE_DEFAULT = "MOVE_DEFAULT" # ramp to DEFAULT_JOINT_POS
+    POLICY = "POLICY"             # ONNX control
 
 
 class FirstOrderLowPass:
@@ -68,10 +144,39 @@ class Runtime:
                  slomo: bool = False,
                  active_mask: np.ndarray | None = None,
                  joystick_max_vel: float = 0.8,
-                 home_on_start: bool = True,
-                 home_speed: float = 0.3):
-        self._home_on_start = home_on_start
-        self._home_speed = home_speed
+                 pose_speed: float = 0.3,
+                 pose_tolerance: float = 0.15,
+                 debug: bool = False,
+                 debug_actions: int = 10,
+                 debug_max_dq: float = 0.1):
+        # Per-joint ramp rate when moving to zero / default pose via X or Y.
+        self._pose_speed = float(pose_speed)
+        # B (→POLICY) is gated: current measured pos must be within this
+        # L∞ tolerance of DEFAULT_JOINT_POS, else the press is rejected.
+        self._pose_tolerance = float(pose_tolerance)
+
+        # State machine — started in IDLE so the user controls when the
+        # motors start applying torque.
+        self._mode = Mode.IDLE
+        self._mode_entered_t = time.monotonic()
+        self._pose_goal = DEFAULT_JOINT_POS.copy()
+
+        # Emergency stop — when True the motor thread keeps damping (kp=0,
+        # velocity=0) every tick instead of tracking target_curr. The main
+        # loop is torn down via self._stop; finally-block then disables
+        # motors. Latched — there is no un-ESTOP without restarting.
+        self._estop_engaged = False
+
+        # Debug mode — sanity check for per-joint rotation direction. When
+        # True, pressing B arms a bounded policy session: at most
+        # ``debug_actions`` ticks of ONNX control are executed, each with
+        # the per-joint target delta clamped to ±``debug_max_dq`` rad, then
+        # the program terminates cleanly.
+        self._debug = bool(debug)
+        self._debug_max_actions = int(debug_actions)
+        self._debug_max_dq = float(debug_max_dq)
+        self._debug_actions_left = 0
+
         if bus == "both":
             active_channels = None
         elif bus == "usb":
@@ -80,23 +185,28 @@ class Runtime:
             active_channels = (can_spi,)
         else:
             raise ValueError(f"--bus must be one of usb/spi/both, got {bus!r}")
+
+        # Joystick — REQUIRED. X/Y/B/A are the only control surface and A
+        # is the emergency stop, so we refuse to run without a controller.
+        # Opened FIRST so that a missing controller fails fast before any
+        # CAN/IMU hardware is brought up.
+        try:
+            self._joystick = Joystick(max_lin_vel=joystick_max_vel)
+            self._joystick.start()
+        except Exception as e:
+            raise RuntimeError(
+                f"No joystick detected ({e}). Plug in an Xbox-compatible "
+                f"controller and retry — operation requires A (ESTOP), "
+                f"X (zero pose), Y (default pose), B (policy)."
+            ) from e
+        log.info("joystick attached — left stick drives velocity_cmd "
+                 "(max %.2f m/s)", joystick_max_vel)
+
         self._motors = MotorBus(can_usb=can_usb, can_spi=can_spi,
                                 active_channels=active_channels)
         self._imu = Imu()
         self._policy = DeployedPolicy(policy_dir)
         self._obs_builder = ObservationBuilder()
-
-        # Joystick — best-effort. If no controller is plugged in, fall back
-        # to a zero velocity command (robot stands in place).
-        self._joystick: Joystick | None = None
-        try:
-            joy = Joystick(max_lin_vel=joystick_max_vel)
-            joy.start()
-            self._joystick = joy
-            log.info("joystick attached — left stick drives velocity_cmd "
-                     "(max %.2f m/s)", joystick_max_vel)
-        except Exception as e:
-            log.warning("joystick unavailable (%s) — velocity_cmd stays zero", e)
 
         # Shared state between policy tick and motor tick
         self._lock = threading.Lock()
@@ -105,9 +215,6 @@ class Runtime:
         self._target_t = time.monotonic()
         self._kp_scale = 0.0
         self._stop = threading.Event()
-
-        # Command — used when no joystick is attached.
-        self._velocity_cmd = np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
         self._lpf = FirstOrderLowPass(LPF_CUTOFF_HZ, MOTOR_DT, N_JOINTS)
         self._lpf.reset(DEFAULT_JOINT_POS)
@@ -141,8 +248,12 @@ class Runtime:
                 kp_scale = self._kp_scale
                 stale_for = now - t0
 
+            # ESTOP latched — skip normal command path, keep damping until
+            # the main thread joins us in the finally block.
+            if self._estop_engaged:
+                self._motors.damp_all()
             # Watchdog — drop to damping if policy is missing ticks
-            if stale_for > POLICY_WATCHDOG_S * 2:
+            elif stale_for > POLICY_WATCHDOG_S * 2:
                 self._motors.damp_all()
             else:
                 # First-order hold from prev → curr over POLICY_DT
@@ -176,11 +287,8 @@ class Runtime:
         q  = self._motors.joint_pos
         qd = self._motors.joint_vel
 
-        velocity_cmd = (self._joystick.velocity_cmd
-                        if self._joystick is not None
-                        else self._velocity_cmd)
         obs = self._obs_builder.build(
-            velocity_cmd=velocity_cmd,
+            velocity_cmd=self._joystick.velocity_cmd,
             base_ang_vel_root=ang_vel,
             projected_gravity=proj_g,
             joint_pos=q,
@@ -204,58 +312,175 @@ class Runtime:
         self._obs_builder.push_action(action)
         self._obs_builder.step_phase()
 
+        debug_terminate = False
         with self._lock:
             if self._slomo_dq_max is not None:
                 dq = np.clip(q_target - self._target_curr,
                              -self._slomo_dq_max, self._slomo_dq_max)
                 q_target = self._target_curr + dq
+            if self._debug and self._debug_actions_left > 0:
+                dq = np.clip(q_target - self._target_curr,
+                             -self._debug_max_dq, self._debug_max_dq)
+                q_target = self._target_curr + dq
+                self._debug_actions_left -= 1
+                done = self._debug_max_actions - self._debug_actions_left
+                max_dq = float(np.max(np.abs(dq)))
+                log.info("DEBUG action %d/%d — max |Δq|=%.3f rad",
+                         done, self._debug_max_actions, max_dq)
+                if self._debug_actions_left == 0:
+                    debug_terminate = True
             self._target_prev = self._target_curr
             self._target_curr = q_target
             self._target_t = time.monotonic()
+        if debug_terminate:
+            log.warning("DEBUG actions exhausted — terminating")
+            self._stop.set()
+
+    # -- mode transitions ---------------------------------------------------
+    def _set_mode(self, new_mode: Mode) -> None:
+        if new_mode is self._mode:
+            return
+        self._mode = new_mode
+        self._mode_entered_t = time.monotonic()
+        log.info("mode → %s", new_mode.value)
+
+    def _trigger_estop(self, reason: str) -> None:
+        """Latch the ESTOP flag, best-effort damp motors, signal shutdown.
+
+        Safe to call from any thread. Motor thread will see
+        ``_estop_engaged`` on its next tick and keep damping until the
+        ``_stop`` event tears down the loops and the finally-block
+        disables motors.
+        """
+        self._estop_engaged = True
+        log.error("!! EMERGENCY STOP !! %s", reason)
+        try:
+            self._motors.damp_all()
+        except Exception as e:  # estop path — keep going no matter what
+            log.error("damp_all during ESTOP raised: %s", e)
+        self._stop.set()
+
+    def _on_button(self, btn: int) -> None:
+        if self._estop_engaged:
+            return
+        if btn == BUTTON_A:
+            self._trigger_estop("A button pressed")
+            return
+        if btn == BUTTON_X:
+            self._pose_goal = ZERO_JOINT_POS.copy()
+            self._set_mode(Mode.MOVE_ZERO)
+        elif btn == BUTTON_Y:
+            self._pose_goal = DEFAULT_JOINT_POS.copy()
+            self._set_mode(Mode.MOVE_DEFAULT)
+        elif btn == BUTTON_B:
+            err = float(np.max(np.abs(self._motors.joint_pos - DEFAULT_JOINT_POS)))
+            if err > self._pose_tolerance:
+                log.warning("B ignored — max joint error %.3f rad > tol %.3f; "
+                            "press Y first to reach DEFAULT_JOINT_POS",
+                            err, self._pose_tolerance)
+                return
+            # Sync LPF + observation state so the first policy tick starts
+            # clean from the current pose.
+            self._obs_builder.last_action = np.zeros(N_JOINTS, dtype=np.float32)
+            self._lpf.reset(self._motors.joint_pos)
+            if self._debug:
+                self._debug_actions_left = self._debug_max_actions
+                log.warning("DEBUG mode armed — %d policy actions @ "
+                            "≤%.2f rad/joint each, then terminate.",
+                            self._debug_max_actions, self._debug_max_dq)
+            self._set_mode(Mode.POLICY)
+
+    # -- per-tick dispatcher ------------------------------------------------
+    def _tick(self) -> None:
+        now = time.monotonic()
+        ramp = min((now - self._mode_entered_t) / KP_RAMP_S, 1.0)
+
+        if self._mode is Mode.IDLE:
+            # Legs hang freely. Keep target glued to measured pos so a
+            # later mode transition doesn't start from a stale target.
+            q_target = self._motors.joint_pos.astype(np.float32).copy()
+            kp_scale = 0.0
+        elif self._mode in (Mode.MOVE_ZERO, Mode.MOVE_DEFAULT):
+            with self._lock:
+                current = self._target_curr.copy()
+            # Synchronized ramp: every joint moves at a rate proportional
+            # to its remaining travel so they all arrive at pose_goal at
+            # the same moment. The joint with the longest travel moves at
+            # pose_speed; shorter-travel joints move proportionally slower.
+            # Result: hip_pitch, knee, ankle, etc. curl in concert — a
+            # natural human-like squat rather than one joint racing ahead
+            # while the others are still at zero.
+            remaining = self._pose_goal - current
+            max_abs = float(np.max(np.abs(remaining)))
+            step_max = self._pose_speed * POLICY_DT
+            if max_abs <= step_max:
+                q_target = self._pose_goal.astype(np.float32).copy()
+            else:
+                dq = remaining * (step_max / max_abs)
+                q_target = (current + dq).astype(np.float32)
+            kp_scale = ramp
+        elif self._mode is Mode.POLICY:
+            # _policy_tick updates target_curr under lock itself.
+            self._policy_tick()
+            with self._lock:
+                self._kp_scale = ramp
+            return
+        else:  # unreachable
+            return
+
+        with self._lock:
+            self._target_prev = self._target_curr
+            self._target_curr = q_target
+            self._target_t = now
+            self._kp_scale = kp_scale
 
     # -- lifecycle ----------------------------------------------------------
     def run(self) -> None:
         self._motors.enable_all()
-        if self._home_on_start:
-            self._motors.home(DEFAULT_JOINT_POS, speed=self._home_speed)
-        self._motors.command(DEFAULT_JOINT_POS, np.zeros(N_JOINTS, dtype=np.float32), kp_scale=0.0)
+        # Let one feedback cycle come back so target_curr seeds from real
+        # measured angles (legs hanging) instead of DEFAULT_JOINT_POS.
+        time.sleep(0.1)
+        self._motors.pump_feedback(budget_s=0.05)
+        initial = self._motors.joint_pos.astype(np.float32).copy()
+        with self._lock:
+            self._target_prev = initial
+            self._target_curr = initial.copy()
+            self._target_t = time.monotonic()
+            self._kp_scale = 0.0
+        self._lpf.reset(initial)
 
         mot = threading.Thread(target=self._motor_loop, daemon=True)
         mot.start()
 
         signal.signal(signal.SIGINT, lambda *_: self._stop.set())
+        log.info("Ready. Buttons: X → zero pose, Y → DEFAULT_JOINT_POS, "
+                 "B → ONNX policy, A → EMERGENCY STOP.")
 
-        t_boot = time.monotonic()
         next_t = time.monotonic()
         hb_next = time.monotonic() + 1.0
         try:
             while not self._stop.is_set():
-                # Soft-start: ramp kp from 0 → 1 over KP_RAMP_S
-                ramp = min((time.monotonic() - t_boot) / KP_RAMP_S, 1.0)
-                with self._lock:
-                    self._kp_scale = ramp
+                for btn in self._joystick.consume_button_events():
+                    self._on_button(btn)
 
                 t0 = time.monotonic()
-                self._policy_tick()
+                self._tick()
                 tick_s = time.monotonic() - t0
-                if tick_s > POLICY_WATCHDOG_S:
+                if self._mode is Mode.POLICY and tick_s > POLICY_WATCHDOG_S:
                     log.warning("policy tick %.1f ms > watchdog", tick_s * 1e3)
 
-                # 1 Hz heartbeat — proves the policy tick is running and
-                # shows what the active joints are being told to do.
                 now = time.monotonic()
                 if now >= hb_next:
                     hb_next = now + 1.0
                     with self._lock:
                         tgt = self._target_curr.copy()
-                    vcmd = (self._joystick.velocity_cmd
-                            if self._joystick is not None
-                            else self._velocity_cmd)
+                        kp = self._kp_scale
+                    vcmd = self._joystick.velocity_cmd
                     active = [(JOINT_ORDER[i], float(tgt[i]),
                                float(self._motors.joint_pos[i]))
                               for i, a in enumerate(self._active_mask) if a]
-                    log.info("hb kp=%.2f vx=%+.2f vy=%+.2f %s",
-                             ramp, vcmd[0], vcmd[1],
+                    log.info("hb mode=%s kp=%.2f vx=%+.2f vy=%+.2f %s",
+                             self._mode.value, kp, vcmd[0], vcmd[1],
                              " ".join(f"{n}:tgt={t:+.3f},q={q:+.3f}"
                                       for n, t, q in active))
 
@@ -270,8 +495,7 @@ class Runtime:
             mot.join(timeout=0.5)
             self._motors.disable_all()
             self._imu.close()
-            if self._joystick is not None:
-                self._joystick.stop()
+            self._joystick.stop()
 
 
 DEPLOY_DIR = Path(__file__).resolve().parent / "scripts" / "deploy"
@@ -294,11 +518,24 @@ def main() -> None:
     parser.add_argument("--slomo", action="store_true",
                         help=f"Clamp per-joint target slew to "
                              f"SLOMO_VMAX_RAD_S ({SLOMO_VMAX_RAD_S} rad/s)")
-    parser.add_argument("--no-home", action="store_true",
-                        help="Skip homing every Robstride motor to "
-                             "DEFAULT_JOINT_POS on startup")
-    parser.add_argument("--home-speed", type=float, default=0.3,
-                        help="Max per-joint speed during homing (rad/s)")
+    parser.add_argument("--pose-speed", type=float, default=0.3,
+                        help="Max per-joint speed (rad/s) when ramping to the "
+                             "zero pose (X) or DEFAULT_JOINT_POS (Y)")
+    parser.add_argument("--pose-tolerance", type=float, default=0.15,
+                        help="Max L∞ joint error (rad) vs DEFAULT_JOINT_POS "
+                             "allowed for the B button to start the policy")
+    parser.add_argument("--debug", action="store_true",
+                        help="After pressing B, run only --debug-actions "
+                             "policy steps with each per-joint target delta "
+                             "clamped to ±--debug-dq rad, then terminate. "
+                             "Use this to verify per-joint rotation axes "
+                             "without risking runaway motion.")
+    parser.add_argument("--debug-actions", type=int, default=10,
+                        help="Number of policy actions to execute in --debug "
+                             "mode (default: 10)")
+    parser.add_argument("--debug-dq", type=float, default=0.1,
+                        help="Per-joint target delta clamp (rad) applied to "
+                             "each policy action in --debug mode (default: 0.1)")
     parser.add_argument("--joints",
                         help="Comma-separated joint names (with or without "
                              "'_joint' suffix) or indices to drive from the "
@@ -314,8 +551,11 @@ def main() -> None:
                  can_usb=args.can_usb, can_spi=args.can_spi,
                  bus=args.bus,
                  slomo=args.slomo, active_mask=active_mask,
-                 home_on_start=not args.no_home,
-                 home_speed=args.home_speed)
+                 pose_speed=args.pose_speed,
+                 pose_tolerance=args.pose_tolerance,
+                 debug=args.debug,
+                 debug_actions=args.debug_actions,
+                 debug_max_dq=args.debug_dq)
     rt.run()
 
 

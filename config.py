@@ -31,8 +31,8 @@ N_JOINTS = len(JOINT_ORDER)
 # Default joint targets — action = raw_action + DEFAULT_JOINT_POS (scale=1.0,
 # use_default_offset=True).  Must match init_state.joint_pos in env.
 DEFAULT_JOINT_POS = np.array([
-    0.00, 0.0,  0.50,  1.31,  0.80,  0.00,   # left leg
-    0.00, 0.0, -0.50, -1.31,  0.80,  0.00,   # right leg
+    0.00, -0.10,  0.90,  1.65,  0.70,  0.00,   # left leg
+    0.00, -0.10, -0.90, -1.65,  0.70,  0.00,   # right leg
 ], dtype=np.float32)
 
 # URDF joint limits (lower, upper) in the same order as JOINT_ORDER.
@@ -75,21 +75,22 @@ class MotorSpec:
 # Motor wiring — IDs match the tested all_homing.py layout.
 # ---------------------------------------------------------------------------
 MOTOR_TABLE: dict[str, MotorSpec] = {
-    "l_hip_yaw_joint":     MotorSpec(can_id=1,  kind=MotorKind.ROBSTRIDE_RS02, kp=12.0, kd=1.5),
+    "l_hip_yaw_joint":     MotorSpec(can_id=1,  kind=MotorKind.ROBSTRIDE_RS02, kp=18.0, kd=1.5),
     "l_hip_roll_joint":    MotorSpec(can_id=2,  kind=MotorKind.ROBSTRIDE_RS03, kp=45.0, kd=6.0),
     "l_hip_pitch_joint":   MotorSpec(can_id=3,  kind=MotorKind.ROBSTRIDE_RS03, kp=45.0, kd=6.0),
-    "l_knee_pitch_joint":  MotorSpec(can_id=4,  kind=MotorKind.ROBSTRIDE_RS03, kp=45.0, kd=6.0),
-    "l_ankle_pitch_joint": MotorSpec(can_id=5,  kind=MotorKind.ROBSTRIDE_RS00, kp=30.0, kd=4.0),
+    "l_knee_pitch_joint":  MotorSpec(can_id=4,  kind=MotorKind.ROBSTRIDE_RS03, direction=-1, kp=45.0, kd=6.0),
+    "l_ankle_pitch_joint": MotorSpec(can_id=5,  kind=MotorKind.ROBSTRIDE_RS00, direction=-1, kp=30.0, kd=4.0),
     "l_ankle_roll_joint":  MotorSpec(can_id=6,  kind=MotorKind.ROBSTRIDE_RS00, kp=15.0, kd=1.5),
 
-    "r_hip_yaw_joint":     MotorSpec(can_id=7,  kind=MotorKind.ROBSTRIDE_RS02, kp=12.0, kd=1.5),
-    "r_hip_roll_joint":    MotorSpec(can_id=8,  kind=MotorKind.ROBSTRIDE_RS03, kp=45.0, kd=6.0),
-    "r_hip_pitch_joint":   MotorSpec(can_id=9,  kind=MotorKind.ROBSTRIDE_RS03, kp=45.0, kd=6.0),
-    "r_knee_pitch_joint":  MotorSpec(can_id=10, kind=MotorKind.ROBSTRIDE_RS03, kp=45.0, kd=6.0),
-    "r_ankle_pitch_joint": MotorSpec(can_id=11, kind=MotorKind.ROBSTRIDE_RS00, kp=30.0, kd=4.0),
-    "r_ankle_roll_joint":  MotorSpec(can_id=12, kind=MotorKind.ROBSTRIDE_RS00, kp=15.0, kd=1.5),
+    # Right-leg motors are physically mirrored from the left, so every
+    # right actuator is flipped (direction=-1) to match URDF sign convention.
+    "r_hip_yaw_joint":     MotorSpec(can_id=7,  kind=MotorKind.ROBSTRIDE_RS02, direction=-1, kp=18.0, kd=1.5),
+    "r_hip_roll_joint":    MotorSpec(can_id=8,  kind=MotorKind.ROBSTRIDE_RS03, direction=1, kp=45.0, kd=6.0),
+    "r_hip_pitch_joint":   MotorSpec(can_id=9,  kind=MotorKind.ROBSTRIDE_RS03, direction=-1, kp=45.0, kd=6.0),
+    "r_knee_pitch_joint":  MotorSpec(can_id=10, kind=MotorKind.ROBSTRIDE_RS03, direction=1, kp=45.0, kd=6.0),
+    "r_ankle_pitch_joint": MotorSpec(can_id=11, kind=MotorKind.ROBSTRIDE_RS00, direction=-1, kp=30.0, kd=4.0),
+    "r_ankle_roll_joint":  MotorSpec(can_id=12, kind=MotorKind.ROBSTRIDE_RS00, direction=-1, kp=15.0, kd=1.5),
 }
-
 
 # ---------------------------------------------------------------------------
 # Loop rates

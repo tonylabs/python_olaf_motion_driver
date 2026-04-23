@@ -1,6 +1,6 @@
 """Motor driver for Robstride RS00/RS02/RS03.
 
-All joints use the in-tree `canable/robstride/lib` package (`RobstrideBus`),
+All joints use the in-tree `lib/robstride` package (`RobstrideBus`),
 which owns its own socketcan socket and implements the real Robstride wire
 format (4×16-bit big-endian words + torque in the arbitration ID extra_data).
 """
@@ -20,8 +20,8 @@ from config import (
     JOINT_ORDER, N_JOINTS,
 )
 
-# The robstride package lives under canable/robstride/lib; add it to path.
-_RS_LIB_PATH = Path(__file__).resolve().parent / "canable" / "robstride" / "lib"
+# The robstride package lives under lib/robstride; add lib/ to path.
+_RS_LIB_PATH = Path(__file__).resolve().parent / "lib"
 if str(_RS_LIB_PATH) not in sys.path:
     sys.path.insert(0, str(_RS_LIB_PATH))
 from robstride import RobstrideBus, Motor, CommunicationType  # noqa: E402
