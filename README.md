@@ -28,10 +28,9 @@ pip install onnxruntime python-can numpy pyyaml
 ## Workflow
 
 ```bash
-# On training machine — export policy + preprocessor
+# On training machine — export policy (rsl_rl bakes the normalizer in)
 uv sync
-python export_policy.py --checkpoint policy.pt --task Olaf-Bipedal-Walking-v0 --out driver/deploy/
-python run.py --policy-dir deploy/
+python run.py
 ```
 
 ## What you MUST verify before enabling torque

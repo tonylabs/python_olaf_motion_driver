@@ -38,7 +38,7 @@ log = logging.getLogger("olaf.imu")
 # From olaf_robstride.urdf imu_joint <origin xyz="-0.095795 0 0.014"/>.
 IMU_OFFSET_IN_BASE = np.array([-0.095795, 0.0, 0.014], dtype=np.float32)
 
-# ---- Serial protocol constants (from imu_receiver.py) --------------------
+# ---- Serial protocol constants (HI226/HI229 vendor protocol) ------------
 FRAME_HEAD = "fc"
 FRAME_END  = "fd"
 TYPE_IMU   = "40"
@@ -46,7 +46,7 @@ TYPE_AHRS  = "41"
 IMU_LEN    = "38"   # 56 bytes
 AHRS_LEN   = "30"   # 48 bytes
 
-# Default serial port for the CP2102 USB-UART bridge
+# Default serial port for the CP2102 USB-UART bridgeP
 DEFAULT_PORT = (
     "/dev/serial/by-id/"
     "usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0"

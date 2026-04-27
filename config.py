@@ -10,45 +10,53 @@ import numpy as np
 
 
 # ---------------------------------------------------------------------------
-# Joint order — MUST match LEG_JOINT_NAMES in olaf_standing_env_cfg.py
+# Joint order — MUST match Isaac Lab's `robot.data.joint_names`, which
+# interleaves [L, R] per family. See SDK_DEPLOYMENT.md §2.
 # ---------------------------------------------------------------------------
 JOINT_ORDER = (
     "l_hip_yaw_joint",
-    "l_hip_roll_joint",
-    "l_hip_pitch_joint",
-    "l_knee_pitch_joint",
-    "l_ankle_pitch_joint",
-    "l_ankle_roll_joint",
     "r_hip_yaw_joint",
+    "l_hip_roll_joint",
     "r_hip_roll_joint",
+    "l_hip_pitch_joint",
     "r_hip_pitch_joint",
+    "l_knee_pitch_joint",
     "r_knee_pitch_joint",
+    "l_ankle_pitch_joint",
     "r_ankle_pitch_joint",
+    "l_ankle_roll_joint",
     "r_ankle_roll_joint",
 )
 N_JOINTS = len(JOINT_ORDER)
 
-# Default joint targets — action = raw_action + DEFAULT_JOINT_POS (scale=1.0,
-# use_default_offset=True).  Must match init_state.joint_pos in env.
+# Default joint pose `q0` (the bent-knee stance the policy was trained
+# around). q_target = q0 + 0.5 * action. SDK_DEPLOYMENT.md §3 — L and R
+# share numeric values; URDF axis flip handles the physical mirror, do
+# NOT sign-flip targets here.
 DEFAULT_JOINT_POS = np.array([
-    0.00, -0.10,  0.90,  1.65,  0.75,  0.00,   # left leg
-    0.00, -0.10, -0.90, -1.65,  0.75,  0.00,   # right leg
+    0.000, 0.000,   # hip_yaw    (L, R)
+    0.000, 0.000,   # hip_roll   (L, R)
+    0.900, 0.900,   # hip_pitch  (L, R)
+    1.650, 1.650,   # knee_pitch (L, R)
+    0.700, 0.700,   # ankle_pitch(L, R)
+    0.000, 0.000,   # ankle_roll (L, R)
 ], dtype=np.float32)
 
-# URDF joint limits (lower, upper) in the same order as JOINT_ORDER.
+# URDF/MJCF joint limits (lower, upper) per SDK_DEPLOYMENT.md §7. Symmetric
+# L/R; clamp q_target to these (NOT the action). Source: olaf_robstride.xml.
 JOINT_LIMITS = np.array([
-    (-0.10,  0.10),  # l_hip_yaw
-    (-0.20,  0.20),  # l_hip_roll
-    (-0.10,  1.20),  # l_hip_pitch
-    ( 0.00,  1.80),  # l_knee_pitch
-    (-0.65,  1.05),  # l_ankle_pitch
-    (-0.26,  0.20),  # l_ankle_roll
-    (-0.10,  0.10),  # r_hip_yaw
-    (-0.20,  0.20),  # r_hip_roll
-    (-1.20,  0.10),  # r_hip_pitch
-    (-1.80,  0.00),  # r_knee_pitch
-    (-0.65,  1.05),  # r_ankle_pitch
-    (-0.20,  0.26),  # r_ankle_roll
+    (-0.2600,  0.2600),  # l_hip_yaw
+    (-0.2600,  0.2600),  # r_hip_yaw
+    (-0.2618,  0.3490),  # l_hip_roll
+    (-0.2618,  0.3490),  # r_hip_roll
+    (-0.1000,  1.4000),  # l_hip_pitch
+    (-0.1000,  1.4000),  # r_hip_pitch
+    (-0.4000,  2.0000),  # l_knee_pitch
+    (-0.4000,  2.0000),  # r_knee_pitch
+    (-0.6500,  1.0500),  # l_ankle_pitch
+    (-0.6500,  1.0500),  # r_ankle_pitch
+    (-0.2000,  0.2600),  # l_ankle_roll
+    (-0.2000,  0.2600),  # r_ankle_roll
 ], dtype=np.float32)
 
 
@@ -73,23 +81,40 @@ class MotorSpec:
 
 # ---------------------------------------------------------------------------
 # Motor wiring — IDs match the tested all_homing.py layout.
+#
+# kp/kd per actuator family come from SDK_DEPLOYMENT.md §2 (the trained
+# gains: RS02 40/3.000, RS03 78.957/5.027, RS00 16.581/1.056). The inner
+# PD must reproduce these so the policy doesn't see a different plant
+# than it trained against.
+#
+# WARNING: the `direction` flags below were calibrated against the OLD
+# asymmetric `DEFAULT_JOINT_POS` (which sign-flipped right-leg targets in
+# URDF frame). The constants above now match SDK_DEPLOYMENT.md §3 (symmetric
+# L/R values, mirroring lives in URDF axes). If the right leg drives in the
+# wrong direction at boot ramp, the right-side `direction` calibrations
+# (esp. r_hip_pitch_joint, r_knee_pitch_joint) likely need to be re-verified
+# on bench — single-joint commands per §11 checklist.
 # ---------------------------------------------------------------------------
+_RS02_KP, _RS02_KD = 40.000, 3.000   # hip_yaw
+_RS03_KP, _RS03_KD = 78.957, 5.027   # hip_roll, hip_pitch, knee_pitch
+_RS00_KP, _RS00_KD = 16.581, 1.056   # ankle_pitch, ankle_roll
+
 MOTOR_TABLE: dict[str, MotorSpec] = {
-    "l_hip_yaw_joint":     MotorSpec(can_id=1,  kind=MotorKind.ROBSTRIDE_RS02, kp=18.0, kd=1.5),
-    "l_hip_roll_joint":    MotorSpec(can_id=2,  kind=MotorKind.ROBSTRIDE_RS03, kp=45.0, kd=6.0),
-    "l_hip_pitch_joint":   MotorSpec(can_id=3,  kind=MotorKind.ROBSTRIDE_RS03, kp=45.0, kd=6.0),
-    "l_knee_pitch_joint":  MotorSpec(can_id=4,  kind=MotorKind.ROBSTRIDE_RS03, direction=-1, kp=45.0, kd=6.0),
-    "l_ankle_pitch_joint": MotorSpec(can_id=5,  kind=MotorKind.ROBSTRIDE_RS00, direction=-1, kp=30.0, kd=4.0),
-    "l_ankle_roll_joint":  MotorSpec(can_id=6,  kind=MotorKind.ROBSTRIDE_RS00, kp=15.0, kd=1.5),
+    "l_hip_yaw_joint":     MotorSpec(can_id=1,  kind=MotorKind.ROBSTRIDE_RS02, kp=_RS02_KP, kd=_RS02_KD),
+    "l_hip_roll_joint":    MotorSpec(can_id=2,  kind=MotorKind.ROBSTRIDE_RS03, kp=_RS03_KP, kd=_RS03_KD),
+    "l_hip_pitch_joint":   MotorSpec(can_id=3,  kind=MotorKind.ROBSTRIDE_RS03, kp=_RS03_KP, kd=_RS03_KD),
+    "l_knee_pitch_joint":  MotorSpec(can_id=4,  kind=MotorKind.ROBSTRIDE_RS03, direction=-1, kp=_RS03_KP, kd=_RS03_KD),
+    "l_ankle_pitch_joint": MotorSpec(can_id=5,  kind=MotorKind.ROBSTRIDE_RS00, direction=-1, kp=_RS00_KP, kd=_RS00_KD),
+    "l_ankle_roll_joint":  MotorSpec(can_id=6,  kind=MotorKind.ROBSTRIDE_RS00, kp=_RS00_KP, kd=_RS00_KD),
 
     # Right-leg motors are physically mirrored from the left, so every
     # right actuator is flipped (direction=-1) to match URDF sign convention.
-    "r_hip_yaw_joint":     MotorSpec(can_id=7,  kind=MotorKind.ROBSTRIDE_RS02, direction=-1, kp=18.0, kd=1.5),
-    "r_hip_roll_joint":    MotorSpec(can_id=8,  kind=MotorKind.ROBSTRIDE_RS03, direction=1, kp=45.0, kd=6.0),
-    "r_hip_pitch_joint":   MotorSpec(can_id=9,  kind=MotorKind.ROBSTRIDE_RS03, direction=-1, kp=45.0, kd=6.0),
-    "r_knee_pitch_joint":  MotorSpec(can_id=10, kind=MotorKind.ROBSTRIDE_RS03, direction=1, kp=45.0, kd=6.0),
-    "r_ankle_pitch_joint": MotorSpec(can_id=11, kind=MotorKind.ROBSTRIDE_RS00, direction=-1, kp=30.0, kd=4.0),
-    "r_ankle_roll_joint":  MotorSpec(can_id=12, kind=MotorKind.ROBSTRIDE_RS00, direction=-1, kp=15.0, kd=1.5),
+    "r_hip_yaw_joint":     MotorSpec(can_id=7,  kind=MotorKind.ROBSTRIDE_RS02, direction=-1, kp=_RS02_KP, kd=_RS02_KD),
+    "r_hip_roll_joint":    MotorSpec(can_id=8,  kind=MotorKind.ROBSTRIDE_RS03, direction=1,  kp=_RS03_KP, kd=_RS03_KD),
+    "r_hip_pitch_joint":   MotorSpec(can_id=9,  kind=MotorKind.ROBSTRIDE_RS03, direction=1,  kp=_RS03_KP, kd=_RS03_KD),
+    "r_knee_pitch_joint":  MotorSpec(can_id=10, kind=MotorKind.ROBSTRIDE_RS03, direction=-1, kp=_RS03_KP, kd=_RS03_KD),
+    "r_ankle_pitch_joint": MotorSpec(can_id=11, kind=MotorKind.ROBSTRIDE_RS00, direction=-1, kp=_RS00_KP, kd=_RS00_KD),
+    "r_ankle_roll_joint":  MotorSpec(can_id=12, kind=MotorKind.ROBSTRIDE_RS00, direction=-1, kp=_RS00_KP, kd=_RS00_KD),
 }
 
 # ---------------------------------------------------------------------------
@@ -104,7 +129,6 @@ MOTOR_HZ        = 200.0
 POLICY_DT       = 1.0 / POLICY_HZ
 MOTOR_DT        = 1.0 / MOTOR_HZ
 LPF_CUTOFF_HZ   = 37.5                      # per paper §VII-C
-GAIT_PERIOD_S   = 0.6                       # must match ObsTerm gait_phase params
 
 # Safety
 POLICY_WATCHDOG_S = 0.040                   # drop to damping if policy misses

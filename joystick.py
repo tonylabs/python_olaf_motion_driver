@@ -1,20 +1,22 @@
 """Xbox One S controller → robot velocity command.
 
-The left stick drives the robot:
+Stick mapping (ROS REP-103: +x forward, +y left, +wz CCW):
     left-stick up    →  +vx (forward)
     left-stick down  →  -vx (backward)
     left-stick left  →  +vy (left)
     left-stick right →  -vy (right)
+    right-stick left →  +wz (turn left / CCW)
+    right-stick right→  -wz (turn right / CW)
 
-Convention follows ROS REP-103: +x forward, +y left. Stick axes are inverted
-from SDL's raw values (SDL: up = -1) to give this convention directly.
+Stick axes are inverted from SDL's raw values (SDL: up/right = +1) to give
+this convention directly.
 
 Use from `run.py` like:
 
-    joy = Joystick(max_lin_vel=0.8)
+    joy = Joystick()
     joy.start()
     ...
-    self._velocity_cmd = joy.velocity_cmd    # in policy tick
+    self._velocity_cmd = joy.velocity_cmd    # (3,) [vx, vy, wz]
     ...
     joy.stop()
 
@@ -35,6 +37,9 @@ import pygame
 
 _AXIS_LEFT_X = 0
 _AXIS_LEFT_Y = 1
+# SDL right-stick X on Xbox One S over USB is index 3. Over Bluetooth on some
+# kernels it's 2 — verify with `jstest /dev/input/js0` if turning feels off.
+_AXIS_RIGHT_X = 3
 
 # SDL button indices (Xbox / Xbox One S layout)
 BUTTON_A = 0
@@ -45,23 +50,26 @@ _TRACKED_BUTTONS = (BUTTON_A, BUTTON_B, BUTTON_X, BUTTON_Y)
 
 
 class Joystick:
-    """Background-polled Xbox controller. Exposes a 4-vector
-    `velocity_cmd = [vx, vy, wz, heading]` matching the policy's obs.
+    """Background-polled Xbox controller. Exposes a 3-vector
+    `velocity_cmd = [vx, vy, wz]` matching the policy's obs term.
 
-    Only vx / vy are driven by the left stick; wz and heading stay zero.
+    Defaults stay inside the training command envelope (PLAY: vx ∈ [-0.4, 0.7],
+    vy ∈ [-0.4, 0.4], wz ∈ [-1, 1]); pushing past these is OOD.
     """
 
     def __init__(self,
                  device: int = 0,
-                 max_lin_vel: float = 1.0,
+                 max_lin_vel: float = 0.6,
+                 max_ang_vel: float = 1.0,
                  deadzone: float = 0.08,
                  poll_hz: float = 100.0):
         self._device = device
         self._max_v = float(max_lin_vel)
+        self._max_w = float(max_ang_vel)
         self._deadzone = float(deadzone)
         self._dt = 1.0 / float(poll_hz)
 
-        self._cmd = np.zeros(4, dtype=np.float32)
+        self._cmd = np.zeros(3, dtype=np.float32)   # [vx, vy, wz]
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -89,12 +97,14 @@ class Joystick:
             self._thread.join(timeout=0.5)
         if self._js is not None:
             self._js.quit()
-        pygame.quit()
+        # Tear down the joystick subsystem only — full pygame.quit() would
+        # break any other pygame use in the host process.
+        pygame.joystick.quit()
 
     # -- public state -------------------------------------------------------
     @property
     def velocity_cmd(self) -> np.ndarray:
-        """(4,) float32 snapshot of [vx, vy, wz, heading]. Safe to read."""
+        """(3,) float32 snapshot of [vx, vy, wz]. Safe to read."""
         with self._lock:
             return self._cmd.copy()
 
@@ -119,10 +129,12 @@ class Joystick:
             pygame.event.pump()   # required for axis/button values to refresh
             lx = self._apply_deadzone(self._js.get_axis(_AXIS_LEFT_X))
             ly = self._apply_deadzone(self._js.get_axis(_AXIS_LEFT_Y))
-            # SDL: stick up = -1, stick right = +1. Flip both so the robot
-            # convention (forward = +vx, left = +vy) matches the user.
+            rx = self._apply_deadzone(self._js.get_axis(_AXIS_RIGHT_X))
+            # SDL: stick up = -1, stick right = +1. Flip to match ROS REP-103:
+            # forward = +vx, left = +vy, CCW (stick left) = +wz.
             vx = -ly * self._max_v
             vy = -lx * self._max_v
+            wz = -rx * self._max_w
 
             new_presses: list[int] = []
             for btn in _TRACKED_BUTTONS:
@@ -137,7 +149,7 @@ class Joystick:
             with self._lock:
                 self._cmd[0] = vx
                 self._cmd[1] = vy
-                # wz and heading stay zero — not driven by left stick
+                self._cmd[2] = wz
                 if new_presses:
                     self._button_events.extend(new_presses)
             time.sleep(self._dt)
@@ -147,21 +159,23 @@ def main() -> None:
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--max-vel", type=float, default=1.0)
+    parser.add_argument("--max-lin-vel", type=float, default=0.6)
+    parser.add_argument("--max-ang-vel", type=float, default=1.0)
     parser.add_argument("--deadzone", type=float, default=0.08)
     args = parser.parse_args()
 
     joy = Joystick(device=args.device,
-                   max_lin_vel=args.max_vel,
+                   max_lin_vel=args.max_lin_vel,
+                   max_ang_vel=args.max_ang_vel,
                    deadzone=args.deadzone)
     joy.start()
-    print(f"Joystick started. max_vel={args.max_vel} m/s, "
+    print(f"Joystick started. max_lin_vel={args.max_lin_vel} m/s, "
+          f"max_ang_vel={args.max_ang_vel} rad/s, "
           f"deadzone={args.deadzone}. Ctrl+C to stop.")
     try:
         while True:
             cmd = joy.velocity_cmd
-            print(f"\rvx={cmd[0]:+.2f}  vy={cmd[1]:+.2f}  "
-                  f"wz={cmd[2]:+.2f}  hdg={cmd[3]:+.2f}",
+            print(f"\rvx={cmd[0]:+.2f}  vy={cmd[1]:+.2f}  wz={cmd[2]:+.2f}",
                   end="", flush=True)
             time.sleep(0.05)
     except KeyboardInterrupt:

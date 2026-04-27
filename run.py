@@ -18,10 +18,6 @@ Buttons:
 
 Command-line arguments:
 
-    --policy-dir PATH
-        Directory containing ``policy.onnx`` + ``preprocessor.json``.
-        Default: ``scripts/deploy/``.
-
     --can-usb CHANNEL        (default: ``can_usb``)
     --can-spi CHANNEL        (default: ``can_spi``)
         CAN interface names. Left leg (motor IDs 1–6) goes on --can-usb,
@@ -85,7 +81,6 @@ import signal
 import threading
 import time
 from enum import Enum
-from pathlib import Path
 
 # Suppress ONNX Runtime GPU discovery warning on headless / GPU-less boards
 os.environ.setdefault("ORT_DISABLE_GPU_DEVICE_ENUMERATION", "1")
@@ -138,12 +133,12 @@ class FirstOrderLowPass:
 
 
 class Runtime:
-    def __init__(self, policy_dir: Path,
+    def __init__(self,
                  can_usb: str = "can_usb", can_spi: str = "can_spi",
                  bus: str = "both",
                  slomo: bool = False,
                  active_mask: np.ndarray | None = None,
-                 joystick_max_vel: float = 0.8,
+                 joystick_max_vel: float = 0.6,
                  pose_speed: float = 0.3,
                  pose_tolerance: float = 0.15,
                  debug: bool = False,
@@ -205,7 +200,7 @@ class Runtime:
         self._motors = MotorBus(can_usb=can_usb, can_spi=can_spi,
                                 active_channels=active_channels)
         self._imu = Imu()
-        self._policy = DeployedPolicy(policy_dir)
+        self._policy = DeployedPolicy()
         self._obs_builder = ObservationBuilder()
 
         # Shared state between policy tick and motor tick
@@ -310,7 +305,6 @@ class Runtime:
         q_target = np.where(self._active_mask, q_target, DEFAULT_JOINT_POS)
 
         self._obs_builder.push_action(action)
-        self._obs_builder.step_phase()
 
         debug_terminate = False
         with self._lock:
@@ -479,8 +473,8 @@ class Runtime:
                     active = [(JOINT_ORDER[i], float(tgt[i]),
                                float(self._motors.joint_pos[i]))
                               for i, a in enumerate(self._active_mask) if a]
-                    log.info("hb mode=%s kp=%.2f vx=%+.2f vy=%+.2f %s",
-                             self._mode.value, kp, vcmd[0], vcmd[1],
+                    log.info("hb mode=%s kp=%.2f vx=%+.2f vy=%+.2f wz=%+.2f %s",
+                             self._mode.value, kp, vcmd[0], vcmd[1], vcmd[2],
                              " ".join(f"{n}:tgt={t:+.3f},q={q:+.3f}"
                                       for n, t, q in active))
 
@@ -498,14 +492,8 @@ class Runtime:
             self._joystick.stop()
 
 
-DEPLOY_DIR = Path(__file__).resolve().parent / "scripts" / "deploy"
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--policy-dir", type=Path, default=DEPLOY_DIR,
-                        help="Directory with policy.onnx + preprocessor.json "
-                             "(default: scripts/deploy/)")
     parser.add_argument("--can-usb", default="can_usb",
                         help="CAN channel carrying motor IDs 1-6 (left leg)")
     parser.add_argument("--can-spi", default="can_spi",
@@ -547,8 +535,7 @@ def main() -> None:
 
     assert len(JOINT_ORDER) == N_JOINTS
     active_mask = _parse_active_mask(args.joints)
-    rt = Runtime(args.policy_dir,
-                 can_usb=args.can_usb, can_spi=args.can_spi,
+    rt = Runtime(can_usb=args.can_usb, can_spi=args.can_spi,
                  bus=args.bus,
                  slomo=args.slomo, active_mask=active_mask,
                  pose_speed=args.pose_speed,
