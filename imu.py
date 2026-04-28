@@ -65,32 +65,48 @@ def lever_arm_velocity_correction(v_imu_root: np.ndarray,
 
 def _projected_gravity_from_quat(qw: float, qx: float,
                                  qy: float, qz: float) -> np.ndarray:
-    """Compute R_world→body @ [0,0,-1] from a body-to-world quaternion.
+    """Compute R_world→body @ (0,0,-1) from a body-to-world quaternion.
 
-    The third column of R(q) is R @ [0,0,1], so R^T @ [0,0,-1] = −col_2(R).
+    R_world_from_body has body axes in its COLUMNS, so the body-frame
+    coordinates of a world vector v are R^T @ v, which selects ROWS of R.
+    For v = (0, 0, -1) we therefore need
+        proj_g_body = R^T @ (0, 0, -1) = -R[2, :] = -row_2(R)
+    NOT -col_2(R) (which is body_z expressed in world and has the wrong
+    X/Y signs once the body is tilted). The previous version used -col_2
+    and produced silently-wrong projected gravity whenever roll/pitch
+    were non-zero.
+
     Returns the canonical "gravity straight down" if the quaternion is
-    malformed (zero norm or non-finite), since a bad serial frame must not
-    be allowed to poison the control loop with NaN/inf.
+    malformed (zero norm or non-finite), since a bad serial frame must
+    not be allowed to poison the control loop with NaN/inf.
     """
     norm_sq = qw * qw + qx * qx + qy * qy + qz * qz
     if not math.isfinite(norm_sq) or norm_sq < 1e-6 or norm_sq > 4.0:
         return np.array([0.0, 0.0, -1.0], dtype=np.float32)
-    col2 = np.array([
-        2.0 * (qx * qz + qw * qy),
-        2.0 * (qy * qz - qw * qx),
-        1.0 - 2.0 * (qx * qx + qy * qy),
+    row2 = np.array([
+        2.0 * (qx * qz - qw * qy),       # R[2, 0]
+        2.0 * (qy * qz + qw * qx),       # R[2, 1]
+        1.0 - 2.0 * (qx * qx + qy * qy), # R[2, 2]
     ], dtype=np.float64)
-    return (-col2).astype(np.float32)
+    return (-row2).astype(np.float32)
 
 
 class Imu:
-    # IMU frame → robot base_link frame (180° rotation about Y).
-    # robot_x = −imu_x, robot_y = imu_y, robot_z = −imu_z.
-    R_base_from_imu: np.ndarray = np.array(
-        [[-1, 0, 0],
-         [0, 1, 0],
-         [0, 0, -1]], dtype=np.float32,
-    )
+    # IMU chip body frame → robot base_link frame.
+    #
+    # Empirical calibration (2026-04-28 dump on Olaf, robot ~level on
+    # floor): chip reports accel_z ≈ -g and quaternion R[2,2] ≈ +0.996,
+    # which together mean chip_z is aligned with world_z (UP). The chip
+    # is therefore mounted "upright" and its body frame matches Olaf's
+    # base_link REP-103 convention (forward=+x, left=+y, up=+z) directly
+    # — no rotation needed.
+    #
+    # If a tilt-test (front-tilt vs side-tilt) reveals that proj_g_x and
+    # proj_g_y are swapped, replace this with the appropriate yaw-only
+    # 90°-multiple in-plane sub-matrix (e.g. [[0,-1,0],[1,0,0],[0,0,1]])
+    # — but do NOT touch the z row, since the data conclusively shows
+    # chip_z = +base_z.
+    R_base_from_imu: np.ndarray = np.eye(3, dtype=np.float32)
 
     def __init__(
         self,

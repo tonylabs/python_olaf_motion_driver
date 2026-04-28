@@ -257,6 +257,32 @@ class MotorBus:
             qd_cmd = float(qd_des[i])
             kp = s.kp * kp_scale
             kd = s.kd
+
+            # Software torque cap — mirrors training-side effort_limit_sim
+            # (RS02 11.9, RS03 42.0, RS00 14.0 N·m). Robstride firmware
+            # closes its inner PD itself, so we cannot pass a torque limit
+            # over the wire; instead we shrink the position deviation so
+            # the predicted closed-loop torque
+            #   τ̂ = kp·(q_cmd − q_meas) + kd·(qd_cmd − qd_meas)
+            # stays within ±tau_limit. Damping term is allotted first
+            # (stability priority); whatever budget remains is given to kp.
+            if s.tau_limit > 0.0 and kp > 1e-6:
+                q_meas = float(self._pos[i])
+                qd_meas = float(self._vel[i])
+                tau_kd = kd * (qd_cmd - qd_meas)
+                budget = s.tau_limit - abs(tau_kd)
+                if budget <= 0.0:
+                    # Damping alone is over budget — hold the measured pos
+                    # so kp contributes 0. Inner PD will still apply the
+                    # (already-saturated) damping torque.
+                    q_cmd = q_meas
+                else:
+                    max_dq = budget / kp
+                    if q_cmd - q_meas > max_dq:
+                        q_cmd = q_meas + max_dq
+                    elif q_cmd - q_meas < -max_dq:
+                        q_cmd = q_meas - max_dq
+
             # RobstrideBus.write_operation_frame applies calibration
             # (direction + homing_offset) internally — pass URDF-frame.
             self._rs_libs[self._rs_channel[i]].write_operation_frame(

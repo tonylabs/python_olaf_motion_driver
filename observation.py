@@ -1,7 +1,8 @@
 """Observation assembly — must match the deployed ONNX policy input.
 
-Per SDK_DEPLOYMENT.md §4, the policy expects 45 floats in this exact order
-and per-term scaling:
+The policy expects 45 floats in this exact order and per-term scaling
+(source: rl/olaf_bipedal_robot/tasks/manager_based/olaf_locomotion/
+ olaf_env_cfg.py:120-135 ObservationsCfg.PolicyCfg):
 
     idx range │ term                        │ scale │ shape
     ──────────┼─────────────────────────────┼───────┼───────
@@ -12,7 +13,7 @@ and per-term scaling:
       30:42   │ last_action (raw, pre-scale)│ 1.00  │ (12,)
       42:45   │ velocity_command (vx,vy,wz) │ 1.00  │ (3,)
 
-Total: 45 floats. Source: olaf_env_cfg.py:126-134.
+Total: 45 floats.
 """
 from __future__ import annotations
 

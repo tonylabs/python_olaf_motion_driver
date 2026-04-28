@@ -19,3 +19,8 @@ wheels/
 
 # ONNX models / deploy artifacts
 *.onnx
+
+
+# Reinforcement Learning Reference
+/rl
+/qmini

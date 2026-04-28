@@ -87,8 +87,9 @@ os.environ.setdefault("ORT_DISABLE_GPU_DEVICE_ENUMERATION", "1")
 
 import numpy as np
 from config import (
+    ACTION_SCALE,
     DEFAULT_JOINT_POS,
-    JOINT_LIMITS,
+    JOINT_LIMITS_SOFT,
     JOINT_ORDER,
     KP_RAMP_S,
     LPF_CUTOFF_HZ,
@@ -292,12 +293,15 @@ class Runtime:
         assert obs.shape == (OBS_DIM,)
 
         action = self._policy(obs)                    # raw action
-        q_target = (action + DEFAULT_JOINT_POS).astype(np.float32)
+        q_target = (ACTION_SCALE * action + DEFAULT_JOINT_POS).astype(np.float32)
 
-        # Clamp to URDF joint limits — a saturated policy must not ask the
-        # motor to drive past the mechanical stop. Applied before the
-        # active mask / slomo clamp so the slew limit sees the real target.
-        q_target = np.clip(q_target, JOINT_LIMITS[:, 0], JOINT_LIMITS[:, 1])
+        # Clamp to the SOFT joint limits (95% of URDF range, matching the
+        # training-side `soft_joint_pos_limit_factor=0.95`). Keeps q_target
+        # inside the policy's training distribution and leaves a 5%
+        # mechanical margin before the physical end-stop. Applied before
+        # the active mask / slomo clamp so the slew limit sees the real
+        # target.
+        q_target = np.clip(q_target, JOINT_LIMITS_SOFT[:, 0], JOINT_LIMITS_SOFT[:, 1])
 
         # Hold masked-out joints at their default; only active joints track
         # the policy. Applied before slomo clamp so the clamp sees the

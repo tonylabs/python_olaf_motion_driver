@@ -41,6 +41,14 @@ _AXIS_LEFT_Y = 1
 # kernels it's 2 — verify with `jstest /dev/input/js0` if turning feels off.
 _AXIS_RIGHT_X = 3
 
+# Training command envelope from
+# rl/olaf_bipedal_robot/tasks/manager_based/olaf_locomotion/olaf_env_cfg.py:481-483.
+# Anything outside is OOD for the policy, so the joystick clamps to these
+# (asymmetric on vx — forward range is wider than backward).
+VX_RANGE = (-0.4, 0.7)
+VY_RANGE = (-0.4, 0.4)
+WZ_RANGE = (-1.0, 1.0)
+
 # SDL button indices (Xbox / Xbox One S layout)
 BUTTON_A = 0
 BUTTON_B = 1
@@ -64,6 +72,9 @@ class Joystick:
                  deadzone: float = 0.08,
                  poll_hz: float = 100.0):
         self._device = device
+        # Per-axis pre-clamp scale: stick in [-1, 1] is multiplied by
+        # max_lin_vel / max_ang_vel, then clamped to the training envelope
+        # (VX_RANGE / VY_RANGE / WZ_RANGE) so the policy never sees OOD cmds.
         self._max_v = float(max_lin_vel)
         self._max_w = float(max_ang_vel)
         self._deadzone = float(deadzone)
@@ -132,9 +143,11 @@ class Joystick:
             rx = self._apply_deadzone(self._js.get_axis(_AXIS_RIGHT_X))
             # SDL: stick up = -1, stick right = +1. Flip to match ROS REP-103:
             # forward = +vx, left = +vy, CCW (stick left) = +wz.
-            vx = -ly * self._max_v
-            vy = -lx * self._max_v
-            wz = -rx * self._max_w
+            # Clamp each axis to the training command envelope so the policy
+            # never sees an OOD cmd (esp. vy, where ±0.6 stick > 0.4 train).
+            vx = float(np.clip(-ly * self._max_v, *VX_RANGE))
+            vy = float(np.clip(-lx * self._max_v, *VY_RANGE))
+            wz = float(np.clip(-rx * self._max_w, *WZ_RANGE))
 
             new_presses: list[int] = []
             for btn in _TRACKED_BUTTONS:

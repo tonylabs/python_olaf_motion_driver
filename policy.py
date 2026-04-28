@@ -2,8 +2,12 @@
 
 The rsl_rl exporter (`scripts/rsl_rl/export_policy.py`) bakes the
 RunningStandardScaler into the ONNX graph as `actor(normalizer(obs))`, so
-the SDK feeds raw obs and applies no extra normalization. See
-SDK_DEPLOYMENT.md §8.
+the SDK feeds raw obs and applies no extra normalization.
+
+Note: training-side `agents/rsl_rl_ppo_cfg.py` sets
+`empirical_normalization=False` and `obs_normalization=False`, so the
+baked-in normalizer is the identity at the moment — but never depend on
+that and never pre-normalize obs in this file.
 """
 from __future__ import annotations
 from pathlib import Path
