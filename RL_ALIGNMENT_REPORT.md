@@ -290,6 +290,120 @@ base-frame proj_g  = ( 0.0591,  0.0667, -0.9960)   # |·|=1.0000, z≈-1 ✓
 
 ---
 
-## 总结一句话
+## 八、Raspberry Pi 5（4 GB）部署性能评估（2026-04-29）
 
-**最关键的一处错误是 `run.py:295` 缺失 `0.5` 的动作缩放**，必须立刻修；其次是手动核对 `JOINT_ORDER` 与 Isaac Lab 的实际 `joint_names`；其余多为文档与软件安全门，不修也能跑但建议补齐以防 OOD 与误操作。
+> 评估目标：本 SDK 在 Pi 5 / 4 GB 上能否实时驱动 12-DOF 双足策略（50 Hz 外环、200 Hz 内环、AHRS @ ≥ 100 Hz）。
+>
+> 结论：**可以，且有充足余量**。瓶颈不在 CPU/RAM，而在 **CAN 接口选型** 与 **Linux 实时性**。
+
+### 8.1 计算预算
+
+| 循环 | 频率 | 周期 | 来源 |
+|---|---:|---:|---|
+| ONNX 策略 + obs build (`run.py:_policy_tick`) | 50 Hz | 20 ms | `config.POLICY_HZ` |
+| 电机命令 + LPF + 反馈泵 (`_motor_loop`) | 200 Hz | 5 ms | `config.MOTOR_HZ` |
+| IMU 读取线程（AHRS） | 100–400 Hz | 2.5–10 ms | `imu.py:_poll_loop` |
+| 手柄轮询 | 100 Hz | 10 ms | `joystick.py:_loop` |
+
+### 8.2 策略推理成本
+
+第一节给出网络结构 MLP `[512, 256, 128]`，ELU，输入 45 → 输出 12，**约 188 k MAC / 推理**：
+
+```
+45×512 + 512×256 + 256×128 + 128×12
+= 23,040 + 131,072 + 32,768 + 1,536
+≈ 188,416 MACs
+```
+
+Pi 5（Cortex-A76 @ 2.4 GHz，NEON）跑 ONNX Runtime CPU EP，FP32，`intra_op_num_threads=1`，单次推理 **0.2–0.5 ms**。50 Hz 预算 20 ms，占用 **<3 % 单核**。模型太小，GPU/NPU 反而被调用开销吃掉收益，**坚持 CPU EP**。
+
+### 8.3 电机线程成本
+
+`_motor_loop` 每 5 ms 做：
+
+1. LPF（12 个 float） — 亚 µs。
+2. `motors.command` → 12 × `write_operation_frame` → 12 × `socketcan send`，每次约 30 µs，合计 **~0.4 ms**。
+3. `pump_feedback(budget_s=0.0005)` — 非阻塞耗排，已有上限。
+
+每 tick 总耗时 **~1 ms**，5 ms 预算余量充足。
+
+### 8.4 CAN 总线选型（关键风险）
+
+`config.py:165-167` 已注明：12 motors × 200 Hz × (cmd + reply) 大约 **4800 帧/s 总量**。被 `can_usb`/`can_spi` 拆成左右腿各半。
+
+| 接口 | 评价 |
+|---|---|
+| **USB-CAN（CANable / CANUSB）** @ 1 Mbps | 单条 2400 帧/s 完全 OK，socketcan 送得动 ≥ 50k/s。**推荐**。 |
+| **MCP2515 on SPI**（Pi 5 默认 HAT 常用芯片） | 单条 2400 帧/s **逼近上限**（MCP2515 在 ~700 帧/s 以上突发会丢帧）。**不推荐**作为 `can_spi`。 |
+| **MCP2518FD on SPI** | CAN-FD 控制器，Pi 5 高速 SPI 完全够用，可作为 `can_spi`。 |
+| 双通道 USB-CAN-FD | 最干净的方案，两路都用 USB。 |
+
+> **行动项**：若当前 Pi 5 用了 MCP2515 HAT 做 `can_spi`，切到 **双 USB-CAN** 或 **MCP2518FD**。这是部署到物理机上需要先确认的硬件项。
+
+CAN-FD（`config.CAN_FD_ENABLED`）目前关闭。开启后 5 Mbps 数据相需要：① 内核 `fd on`，② 每个电机固件配 FD，③ 适配器支持 FD。前两条没做之前不要打开。
+
+### 8.5 IMU 串口（921600 baud）
+
+Pi 5 PL011 硬 UART 跑 921600 完全稳；CP2102 USB-UART（`imu.py:50-53` 路径）走 USB CDC-ACM，波特率不影响实际带宽。**无问题**。
+
+切忌把 IMU 降到 115200——AHRS 帧 56 字节 + IMU 帧 64 字节 = 一对 1200 bit，100 Hz 已经超过 115200 ceil，会丢帧 → policy 拿到陈旧 `proj_g` → 不可接受（详见 §九 IMU 帧契约）。
+
+### 8.6 内存
+
+冷启动占用：
+
+| 组件 | 占用 |
+|---|---:|
+| Python + numpy + pyserial + python-can + onnxruntime | ~250 MB |
+| ONNX session（小 MLP） | ~15 MB |
+| pygame（手柄） | ~30 MB |
+| 机器人状态 / obs 历史 / LPF 状态 | < 1 MB |
+| **总计** | **~300 MB** |
+
+4 GB 大量过剩，2 GB Pi 5 也能跑。冗余可用于额外的 rosbag 日志、Web 仪表盘等。
+
+### 8.7 实时性（真正的风险）
+
+Linux 不是硬实时系统。两个具体风险：
+
+1. **`POLICY_WATCHDOG_S = 0.040`**（`config.py:177`）：单次策略 tick > 40 ms 时，电机线程会切到 damping。stock Raspberry Pi OS 会偶发 10–30 ms 的调度卡顿（GC、磁盘 I/O 抢占、Swap）。
+2. **GIL**：ONNX `Run()` 内部释放 GIL，策略推理期间电机线程能跑；但 `observation.py` obs-build 是纯 Python，会持 GIL。三线程（policy / motor / IMU）在 Pi 5 四核上不冲突，但若再加高频日志线程要小心。
+
+#### 推荐 Pi 5 上的加固清单
+
+```bash
+# 1. 关闭 swap（避免 stop-the-world）
+sudo dphys-swapfile swapoff
+sudo systemctl disable dphys-swapfile
+
+# 2. 隔离 CPU（在 /boot/firmware/cmdline.txt 加）
+isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3
+
+# 3. 用 SCHED_FIFO 跑控制线程（在启动脚本里）
+sudo chrt -f 90 -p $POLICY_TID
+sudo chrt -f 80 -p $MOTOR_TID
+taskset -cp 2 $POLICY_TID
+taskset -cp 3 $MOTOR_TID
+
+# 4. 可选：装 PREEMPT_RT 内核（最坏延迟从 ~10 ms 降到 <500 µs）
+#    仅当你看到 "policy tick %.1f ms > watchdog" 警告时再考虑
+```
+
+观察手段：`run.py` 已内建 `policy tick %.1f ms > watchdog`（`run.py` 中 `_tick` 的检测）。部署后第一周关注该 warning 频率，作为是否上 PREEMPT_RT 的依据。
+
+### 8.8 部署前 Pi 5 验收清单
+
+| # | 检查项 | 通过判据 |
+|---|---|---|
+| 1 | CAN 接口选型 | 两路均为 USB-CAN-FD 或 USB-CAN 1 Mbps；MCP2515 不应出现在 `can_spi` |
+| 2 | `config.CAN_FD_ENABLED` 与硬件一致 | False（默认）或 True 但内核 + 电机固件 + 适配器都 FD-ready |
+| 3 | IMU 波特率 | `imu.DEFAULT_BAUD = 921_600`，不要降 |
+| 4 | Swap 关闭 | `swapon --show` 无输出 |
+| 5 | CPU 隔离 | `cat /sys/devices/system/cpu/isolated` 显示 `2-3` 或类似 |
+| 6 | 控制线程 SCHED_FIFO | `chrt -p $TID` 显示 `policy: SCHED_FIFO` |
+| 7 | 单次策略推理时长 | 持续观察 5 分钟，无 `policy tick ... > watchdog` 警告 |
+| 8 | CAN 帧丢失 | `ip -s -d link show can_usb` 的 `dropped/overrun` 长期为 0 |
+
+### 8.9 与训练侧的接口稳定性
+
+Pi 5 部署不影响 §七 中列出的“硬契约”——观测维度 / 缩放 / 关节顺序 / 控制频率 / IMU 帧 等都来自训练侧固定常量，与部署平台无关。本节增补的是**平台侧的非功能要求**，目的是让训练侧的契约在 Pi 5 上能稳定满足。

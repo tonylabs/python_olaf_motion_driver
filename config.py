@@ -114,7 +114,7 @@ class MotorSpec:
 
 
 # ---------------------------------------------------------------------------
-# Motor wiring — IDs match the tested all_homing.py layout.
+# Motor wiring — IDs match the layout.
 #
 # kp/kd per actuator family must reproduce the trained gains
 # (rl/olaf_bipedal_robot/robots/olaf.py: RS02 40/3.000, RS03 78.957/5.027,
@@ -129,6 +129,7 @@ class MotorSpec:
 # calibrations (esp. r_hip_pitch_joint, r_knee_pitch_joint) likely need to
 # be re-verified on bench via single-joint slomo runs.
 # ---------------------------------------------------------------------------
+
 _RS02_KP, _RS02_KD = 40.000, 3.000   # hip_yaw
 _RS03_KP, _RS03_KD = 78.957, 5.027   # hip_roll, hip_pitch, knee_pitch
 _RS00_KP, _RS00_KD = 16.581, 1.056   # ankle_pitch, ankle_roll
@@ -139,21 +140,19 @@ _RS03_TAU = 42.0   # hip_roll, hip_pitch, knee_pitch
 _RS00_TAU = 14.0   # ankle_pitch, ankle_roll
 
 MOTOR_TABLE: dict[str, MotorSpec] = {
-    "l_hip_yaw_joint":     MotorSpec(can_id=1,  kind=MotorKind.ROBSTRIDE_RS02, kp=_RS02_KP, kd=_RS02_KD, tau_limit=_RS02_TAU),
-    "l_hip_roll_joint":    MotorSpec(can_id=2,  kind=MotorKind.ROBSTRIDE_RS03, kp=_RS03_KP, kd=_RS03_KD, tau_limit=_RS03_TAU),
-    "l_hip_pitch_joint":   MotorSpec(can_id=3,  kind=MotorKind.ROBSTRIDE_RS03, kp=_RS03_KP, kd=_RS03_KD, tau_limit=_RS03_TAU),
+    "l_hip_yaw_joint":     MotorSpec(can_id=1,  kind=MotorKind.ROBSTRIDE_RS02, direction=1, kp=_RS02_KP, kd=_RS02_KD, tau_limit=_RS02_TAU),
+    "l_hip_roll_joint":    MotorSpec(can_id=2,  kind=MotorKind.ROBSTRIDE_RS03, direction=1, kp=_RS03_KP, kd=_RS03_KD, tau_limit=_RS03_TAU),
+    "l_hip_pitch_joint":   MotorSpec(can_id=3,  kind=MotorKind.ROBSTRIDE_RS03, direction=1, kp=_RS03_KP, kd=_RS03_KD, tau_limit=_RS03_TAU),
     "l_knee_pitch_joint":  MotorSpec(can_id=4,  kind=MotorKind.ROBSTRIDE_RS03, direction=-1, kp=_RS03_KP, kd=_RS03_KD, tau_limit=_RS03_TAU),
     "l_ankle_pitch_joint": MotorSpec(can_id=5,  kind=MotorKind.ROBSTRIDE_RS00, direction=-1, kp=_RS00_KP, kd=_RS00_KD, tau_limit=_RS00_TAU),
-    "l_ankle_roll_joint":  MotorSpec(can_id=6,  kind=MotorKind.ROBSTRIDE_RS00, kp=_RS00_KP, kd=_RS00_KD, tau_limit=_RS00_TAU),
+    "l_ankle_roll_joint":  MotorSpec(can_id=6,  kind=MotorKind.ROBSTRIDE_RS00, direction=1, kp=_RS00_KP, kd=_RS00_KD, tau_limit=_RS00_TAU),
 
-    # Right-leg motors are physically mirrored from the left, so every
-    # right actuator is flipped (direction=-1) to match URDF sign convention.
-    "r_hip_yaw_joint":     MotorSpec(can_id=7,  kind=MotorKind.ROBSTRIDE_RS02, direction=-1, kp=_RS02_KP, kd=_RS02_KD, tau_limit=_RS02_TAU),
+    "r_hip_yaw_joint":     MotorSpec(can_id=7,  kind=MotorKind.ROBSTRIDE_RS02, direction=1, kp=_RS02_KP, kd=_RS02_KD, tau_limit=_RS02_TAU),
     "r_hip_roll_joint":    MotorSpec(can_id=8,  kind=MotorKind.ROBSTRIDE_RS03, direction=1,  kp=_RS03_KP, kd=_RS03_KD, tau_limit=_RS03_TAU),
     "r_hip_pitch_joint":   MotorSpec(can_id=9,  kind=MotorKind.ROBSTRIDE_RS03, direction=1,  kp=_RS03_KP, kd=_RS03_KD, tau_limit=_RS03_TAU),
     "r_knee_pitch_joint":  MotorSpec(can_id=10, kind=MotorKind.ROBSTRIDE_RS03, direction=-1, kp=_RS03_KP, kd=_RS03_KD, tau_limit=_RS03_TAU),
     "r_ankle_pitch_joint": MotorSpec(can_id=11, kind=MotorKind.ROBSTRIDE_RS00, direction=-1, kp=_RS00_KP, kd=_RS00_KD, tau_limit=_RS00_TAU),
-    "r_ankle_roll_joint":  MotorSpec(can_id=12, kind=MotorKind.ROBSTRIDE_RS00, direction=-1, kp=_RS00_KP, kd=_RS00_KD, tau_limit=_RS00_TAU),
+    "r_ankle_roll_joint":  MotorSpec(can_id=12, kind=MotorKind.ROBSTRIDE_RS00, direction=1, kp=_RS00_KP, kd=_RS00_KD, tau_limit=_RS00_TAU),
 }
 
 # ---------------------------------------------------------------------------
@@ -172,6 +171,12 @@ LPF_CUTOFF_HZ   = 37.5                      # per paper §VII-C
 # Safety
 POLICY_WATCHDOG_S = 0.040                   # drop to damping if policy misses
 KP_RAMP_S         = 2.0                     # soft-start ramp on startup
+
+# Max per-joint speed (rad/s) when ramping to zero pose (X) or
+# DEFAULT_JOINT_POS (Y). The ramp is *synchronized*: every joint arrives at
+# its goal simultaneously — the joint with the longest travel moves at this
+# speed, shorter-travel joints move slower in proportion.
+POSE_SPEED_RAD_S  = 0.8
 
 # Slow-motion debug: per-joint velocity cap applied to the policy target
 # before it's published to the motor thread. Enabled via `run.py --slomo`.

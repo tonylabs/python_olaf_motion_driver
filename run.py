@@ -15,6 +15,13 @@ Buttons:
     * **Y** — ramp every joint to ``DEFAULT_JOINT_POS`` (squat pose).
     * **B** — hand control to the ONNX policy (gated by --pose-tolerance).
     * **A** — EMERGENCY STOP: latch, damp motors, exit.
+    * **RB** — encoder-zero calibration. From IDLE, press RB once to enter
+      CALIBRATE: motors go limp, the console streams every joint's q at
+      5 Hz, and you rotate each joint by hand to the pose you want to
+      call "0 rad". Press RB again to write the zero into Robstride flash
+      (firmware command 0x06 + SAVE 0x16 → survives power cycle, no
+      config file needed). An audit record is written to
+      ``calibration.json`` for diagnostics only.
 
 Command-line arguments:
 
@@ -30,13 +37,6 @@ Command-line arguments:
 
     --log-level LEVEL        (default: ``INFO``)
         Python logging level (DEBUG / INFO / WARNING / ERROR).
-
-    --pose-speed RAD_S       (default: 0.3)
-        Max per-joint speed when ramping to the zero pose (X) or to
-        ``DEFAULT_JOINT_POS`` (Y). The ramp is *synchronized*: every joint
-        arrives at its goal simultaneously — the joint with the longest
-        travel moves at this speed, shorter-travel joints move slower in
-        proportion.
 
     --pose-tolerance RAD     (default: 0.15)
         Max L∞ joint error vs ``DEFAULT_JOINT_POS`` allowed for B to
@@ -69,18 +69,21 @@ Examples:
     python run.py                                 # normal operation
     python run.py --debug                         # 10-action axis check
     python run.py --bus usb                       # left leg only
-    python run.py --slomo --pose-speed 0.15       # cautious first run
+    python run.py --slomo                          # cautious first run
     python run.py --joints l_hip_pitch,r_hip_pitch  # single-joint test
 """
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import signal
 import threading
 import time
+from datetime import datetime
 from enum import Enum
+from pathlib import Path
 
 # Suppress ONNX Runtime GPU discovery warning on headless / GPU-less boards
 os.environ.setdefault("ORT_DISABLE_GPU_DEVICE_ENUMERATION", "1")
@@ -97,10 +100,11 @@ from config import (
     N_JOINTS,
     POLICY_DT,
     POLICY_WATCHDOG_S,
+    POSE_SPEED_RAD_S,
     SLOMO_VMAX_RAD_S,
 )
 from imu import Imu
-from joystick import BUTTON_A, BUTTON_B, BUTTON_X, BUTTON_Y, Joystick
+from joystick import BUTTON_A, BUTTON_B, BUTTON_RB, BUTTON_X, BUTTON_Y, Joystick
 from motors import MotorBus
 from observation import ObservationBuilder, OBS_DIM
 from policy import DeployedPolicy
@@ -115,6 +119,7 @@ class Mode(Enum):
     MOVE_ZERO = "MOVE_ZERO"       # ramp to all-zeros pose
     MOVE_DEFAULT = "MOVE_DEFAULT" # ramp to DEFAULT_JOINT_POS
     POLICY = "POLICY"             # ONNX control
+    CALIBRATE = "CALIBRATE"       # motors limp, user moves joints by hand
 
 
 class FirstOrderLowPass:
@@ -140,13 +145,13 @@ class Runtime:
                  slomo: bool = False,
                  active_mask: np.ndarray | None = None,
                  joystick_max_vel: float = 0.6,
-                 pose_speed: float = 0.3,
                  pose_tolerance: float = 0.15,
                  debug: bool = False,
                  debug_actions: int = 10,
                  debug_max_dq: float = 0.1):
-        # Per-joint ramp rate when moving to zero / default pose via X or Y.
-        self._pose_speed = float(pose_speed)
+        # Per-joint ramp rate when moving to zero / default pose via X or Y
+        # — sourced from config.POSE_SPEED_RAD_S, no longer a CLI arg.
+        self._pose_speed = float(POSE_SPEED_RAD_S)
         # B (→POLICY) is gated: current measured pos must be within this
         # L∞ tolerance of DEFAULT_JOINT_POS, else the press is rejected.
         self._pose_tolerance = float(pose_tolerance)
@@ -212,6 +217,14 @@ class Runtime:
         self._kp_scale = 0.0
         self._stop = threading.Event()
 
+        # CALIBRATE mode — set while we're talking directly to the Robstride
+        # libs (SET_ZERO_POSITION + SAVE_PARAMETERS). Motor thread idles so
+        # it doesn't interleave operation frames with the zeroing sequence.
+        self._motor_paused = threading.Event()
+        self._calib_print_t = 0.0
+        # IDLE-mode q+IMU printout throttle (5 Hz).
+        self._idle_print_t = 0.0
+
         self._lpf = FirstOrderLowPass(LPF_CUTOFF_HZ, MOTOR_DT, N_JOINTS)
         self._lpf.reset(DEFAULT_JOINT_POS)
 
@@ -236,6 +249,10 @@ class Runtime:
     def _motor_loop(self) -> None:
         next_t = time.monotonic()
         while not self._stop.is_set():
+            if self._motor_paused.is_set():
+                time.sleep(0.005)
+                next_t = time.monotonic()
+                continue
             now = time.monotonic()
             with self._lock:
                 target_prev = self._target_prev
@@ -358,11 +375,77 @@ class Runtime:
             log.error("damp_all during ESTOP raised: %s", e)
         self._stop.set()
 
+    def _finalize_calibration(self) -> None:
+        """Pause the motor thread, send SET_ZERO_POSITION + SAVE_PARAMETERS
+        to every live motor, write an audit JSON, and drop back to IDLE.
+        """
+        log.warning("Capturing zero — pausing motor thread and writing flash.")
+        self._motor_paused.set()
+        # Brief settle so the in-flight motor tick can finish before we start
+        # poking the same Robstride libs from the main thread.
+        time.sleep(0.02)
+        try:
+            record = self._motors.set_zero_all()
+        except Exception as e:
+            log.error("set_zero_all failed: %s — dropping back to IDLE", e)
+            record = {}
+        finally:
+            # Reseed the target state from the (now-zeroed) measured pose so
+            # that resuming the motor thread doesn't snap to a stale target.
+            self._motors.pump_feedback(budget_s=0.05)
+            initial = self._motors.joint_pos.astype(np.float32).copy()
+            with self._lock:
+                self._target_prev = initial
+                self._target_curr = initial.copy()
+                self._target_t = time.monotonic()
+                self._kp_scale = 0.0
+            self._lpf.reset(initial)
+            self._motor_paused.clear()
+
+        if record:
+            self._save_calibration_record(record)
+        self._set_mode(Mode.IDLE)
+        log.warning("Calibration complete — zero stored to motor flash. "
+                    "Robot can be power-cycled without recalibration.")
+
+    def _save_calibration_record(self, record: dict) -> None:
+        """Write a human-readable audit trail of the zeroing event. The
+        Robstride firmware is the source of truth for the zero — this file
+        is *not* loaded back by the SDK; it exists for diagnostics and so
+        you can spot-check what was captured.
+        """
+        path = Path(__file__).resolve().parent / "calibration.json"
+        payload = {
+            "calibrated_at": datetime.now().isoformat(timespec="seconds"),
+            "note": ("Audit trail only. Zero is stored in Robstride flash "
+                     "via SET_ZERO_POSITION (0x06) + SAVE_PARAMETERS (0x16) "
+                     "and is NOT re-applied from this file."),
+            "motors": record,
+        }
+        try:
+            path.write_text(json.dumps(payload, indent=2) + "\n")
+            log.info("calibration audit written to %s", path)
+        except Exception as e:
+            log.warning("failed to write %s: %s", path, e)
+
     def _on_button(self, btn: int) -> None:
         if self._estop_engaged:
             return
         if btn == BUTTON_A:
             self._trigger_estop("A button pressed")
+            return
+        if btn == BUTTON_RB:
+            if self._mode is Mode.CALIBRATE:
+                self._finalize_calibration()
+            elif self._mode is Mode.IDLE:
+                log.warning("CALIBRATION MODE — motors are LIMP. Move/rotate "
+                            "each joint to the desired ZERO pose, then press "
+                            "RB again to write zero into Robstride flash.")
+                self._calib_print_t = 0.0
+                self._set_mode(Mode.CALIBRATE)
+            else:
+                log.warning("RB ignored — calibration only allowed from IDLE "
+                            "(current mode: %s)", self._mode.value)
             return
         if btn == BUTTON_X:
             self._pose_goal = ZERO_JOINT_POS.copy()
@@ -398,6 +481,33 @@ class Runtime:
             # later mode transition doesn't start from a stale target.
             q_target = self._motors.joint_pos.astype(np.float32).copy()
             kp_scale = 0.0
+            if now - self._idle_print_t >= 0.2:
+                self._idle_print_t = now
+                q = self._motors.joint_pos
+                ang_vel, proj_g, yaw = self._imu.read()
+                q_line = " | ".join(
+                    f"{JOINT_ORDER[i].replace('_joint', '').upper()} "
+                    f"[{float(q[i]):+.3f}]"
+                    for i in range(N_JOINTS))
+                log.info("q: %s", q_line)
+                log.info(
+                    "imu: ang_vel=[x=%+.3f, y=%+.3f, z=%+.3f] "
+                    "proj_g=[x=%+.3f, y=%+.3f, z=%+.3f] yaw=%+.3f",
+                    float(ang_vel[0]), float(ang_vel[1]), float(ang_vel[2]),
+                    float(proj_g[0]),  float(proj_g[1]),  float(proj_g[2]),
+                    float(yaw))
+        elif self._mode is Mode.CALIBRATE:
+            # Limp motors (kp=0). User rotates each joint by hand to the pose
+            # that should become "0 rad". Print joint q at 5 Hz so the user
+            # can see all 12 values converge toward the desired zero pose.
+            q_target = self._motors.joint_pos.astype(np.float32).copy()
+            kp_scale = 0.0
+            if now - self._calib_print_t >= 0.2:
+                self._calib_print_t = now
+                q = self._motors.joint_pos
+                log.info("CALIB q: %s", "  ".join(
+                    f"{JOINT_ORDER[i].replace('_joint', '')}={float(q[i]):+.4f}"
+                    for i in range(N_JOINTS)))
         elif self._mode in (Mode.MOVE_ZERO, Mode.MOVE_DEFAULT):
             with self._lock:
                 current = self._target_curr.copy()
@@ -452,7 +562,8 @@ class Runtime:
 
         signal.signal(signal.SIGINT, lambda *_: self._stop.set())
         log.info("Ready. Buttons: X → zero pose, Y → DEFAULT_JOINT_POS, "
-                 "B → ONNX policy, A → EMERGENCY STOP.")
+                 "B → ONNX policy, RB → encoder-zero calibration, "
+                 "A → EMERGENCY STOP.")
 
         next_t = time.monotonic()
         hb_next = time.monotonic() + 1.0
@@ -470,17 +581,22 @@ class Runtime:
                 now = time.monotonic()
                 if now >= hb_next:
                     hb_next = now + 1.0
-                    with self._lock:
-                        tgt = self._target_curr.copy()
-                        kp = self._kp_scale
-                    vcmd = self._joystick.velocity_cmd
-                    active = [(JOINT_ORDER[i], float(tgt[i]),
-                               float(self._motors.joint_pos[i]))
-                              for i, a in enumerate(self._active_mask) if a]
-                    log.info("hb mode=%s kp=%.2f vx=%+.2f vy=%+.2f wz=%+.2f %s",
-                             self._mode.value, kp, vcmd[0], vcmd[1], vcmd[2],
-                             " ".join(f"{n}:tgt={t:+.3f},q={q:+.3f}"
-                                      for n, t, q in active))
+                    # IDLE prints its own q+imu lines from `_tick`. Other
+                    # modes still get the heartbeat so the operator can see
+                    # mode / kp / vcmd / per-joint target & measurement.
+                    if self._mode is not Mode.IDLE:
+                        with self._lock:
+                            tgt = self._target_curr.copy()
+                            kp = self._kp_scale
+                        vcmd = self._joystick.velocity_cmd
+                        active = [(JOINT_ORDER[i], float(tgt[i]),
+                                   float(self._motors.joint_pos[i]))
+                                  for i, a in enumerate(self._active_mask) if a]
+                        log.info(
+                            "hb mode=%s kp=%.2f vx=%+.2f vy=%+.2f wz=%+.2f %s",
+                            self._mode.value, kp, vcmd[0], vcmd[1], vcmd[2],
+                            " ".join(f"{n}:tgt={t:+.3f},q={q:+.3f}"
+                                     for n, t, q in active))
 
                 next_t += POLICY_DT
                 sleep = next_t - time.monotonic()
@@ -510,9 +626,6 @@ def main() -> None:
     parser.add_argument("--slomo", action="store_true",
                         help=f"Clamp per-joint target slew to "
                              f"SLOMO_VMAX_RAD_S ({SLOMO_VMAX_RAD_S} rad/s)")
-    parser.add_argument("--pose-speed", type=float, default=0.3,
-                        help="Max per-joint speed (rad/s) when ramping to the "
-                             "zero pose (X) or DEFAULT_JOINT_POS (Y)")
     parser.add_argument("--pose-tolerance", type=float, default=0.15,
                         help="Max L∞ joint error (rad) vs DEFAULT_JOINT_POS "
                              "allowed for the B button to start the policy")
@@ -525,24 +638,20 @@ def main() -> None:
     parser.add_argument("--debug-actions", type=int, default=10,
                         help="Number of policy actions to execute in --debug "
                              "mode (default: 10)")
-    parser.add_argument("--debug-dq", type=float, default=0.1,
-                        help="Per-joint target delta clamp (rad) applied to "
+    parser.add_argument("--debug-dq", type=float, default=0.1, help="Per-joint target delta clamp (rad) applied to "
                              "each policy action in --debug mode (default: 0.1)")
-    parser.add_argument("--joints",
-                        help="Comma-separated joint names (with or without "
+    parser.add_argument("--joints", help="Comma-separated joint names (with or without "
                              "'_joint' suffix) or indices to drive from the "
                              "policy. Others hold at DEFAULT_JOINT_POS. "
                              "Default: all 12.")
     args = parser.parse_args()
-    logging.basicConfig(level=args.log_level,
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     assert len(JOINT_ORDER) == N_JOINTS
     active_mask = _parse_active_mask(args.joints)
     rt = Runtime(can_usb=args.can_usb, can_spi=args.can_spi,
                  bus=args.bus,
                  slomo=args.slomo, active_mask=active_mask,
-                 pose_speed=args.pose_speed,
                  pose_tolerance=args.pose_tolerance,
                  debug=args.debug,
                  debug_actions=args.debug_actions,

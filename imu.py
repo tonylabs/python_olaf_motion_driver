@@ -21,6 +21,7 @@ Mounting note — the IMU is rotated 180° about its Y axis relative to
     robot_y =  imu_y
     robot_z = -imu_z
 """
+
 from __future__ import annotations
 
 import logging
@@ -132,6 +133,13 @@ class Imu:
         self._yaw     = 0.0
         self._sample_count = 0
 
+        # Raw chip-frame snapshot, retained for diagnostics (e.g. imu_dump
+        # verifying mounting). Updated alongside the published values under
+        # the same lock so a second consumer cannot race on the serial port.
+        self._raw_accel = np.zeros(3, dtype=np.float32)
+        self._raw_ang_vel = np.zeros(3, dtype=np.float32)
+        self._raw_quat  = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._first_sample = threading.Event()
@@ -157,6 +165,18 @@ class Imu:
         with self._lock:
             return self._ang_vel.copy(), self._proj_g.copy(), self._yaw
 
+    def read_raw(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return chip-frame ``(accel[3], ang_vel[3], quat[4])`` from the
+        latest IMU+AHRS pair, BEFORE ``R_base_from_imu`` is applied.
+
+        Diagnostic-only — for tools like ``imu_dump`` that need to surface
+        the raw chip output alongside ``read()``. Quat is ``[w, x, y, z]``.
+        """
+        with self._lock:
+            return (self._raw_accel.copy(),
+                    self._raw_ang_vel.copy(),
+                    self._raw_quat.copy())
+
     def close(self) -> None:
         self._stop.set()
         if self._thread.is_alive():
@@ -170,6 +190,7 @@ class Imu:
         ser = self._serial
         got_imu = False
         got_ahrs = False
+        accel_raw = np.zeros(3, dtype=np.float32)
         ang_vel_raw = np.zeros(3, dtype=np.float32)
         heading_raw = 0.0
         qw = qx = qy = qz = 0.0
@@ -200,8 +221,12 @@ class Imu:
                 continue
 
             if head_type == TYPE_IMU and check_len == IMU_LEN:
-                # Accelerometer is parsed but currently unused by the policy.
-                _ = struct.unpack("12f ii", data[:56])
+                # Accelerometer is unused by the policy but cached as raw
+                # diagnostic output for `imu_dump`.
+                imu_data = struct.unpack("12f ii", data[:56])
+                accel_raw[0] = imu_data[3]
+                accel_raw[1] = imu_data[4]
+                accel_raw[2] = imu_data[5]
                 got_imu = True
 
             elif head_type == TYPE_AHRS and check_len == AHRS_LEN:
@@ -234,5 +259,11 @@ class Imu:
                 self._ang_vel = ang_vel.astype(np.float32)
                 self._proj_g  = proj_g.astype(np.float32)
                 self._yaw     = float(heading_raw)
+                self._raw_accel = accel_raw.astype(np.float32).copy()
+                self._raw_ang_vel = ang_vel_raw.astype(np.float32).copy()
+                self._raw_quat[0] = qw
+                self._raw_quat[1] = qx
+                self._raw_quat[2] = qy
+                self._raw_quat[3] = qz
                 self._sample_count += 1
             self._first_sample.set()
